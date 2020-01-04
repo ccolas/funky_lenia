@@ -1157,7 +1157,7 @@ class Lenia:
             self.automaton.calc_kernel()
             self.check_auto_load()
 
-    def adjcust_b(self, d):
+    def adjust_b(self, d):
         B = len(self.world.params['b'])
         if B <= 0:
             self.world.params['b'] = [1]
@@ -1206,20 +1206,6 @@ class Lenia:
             self.world.params['b'][i] = min(1, max(0, self.world.params['b'][i] + Fraction(d, 12)))
             self.automaton.calc_kernel()
             self.check_auto_load()
-
-    def adjust_b(self, d):
-        B = len(self.world.params['b'])
-        if B <= 0:
-            self.world.params['b'] = [1]
-        elif B >= 5:
-            self.world.params['b'] = self.world.params['b'][0:5]
-        else:
-            self.world.params['R'] = self.world.params['R'] * B // (B - d)
-        # temp_R = self.tx['R']
-        # self.tx['R'] = self.tx['R'] * (B-d) // B
-        # self.transform_world()
-        # self.world.params['R'] = temp_R
-        # self.automaton.calc_kernel()
 
     ANIMAL_KEY_LIST = {'1': 'O2(a)', '2': 'OG2', '3': 'OV2', '4': 'P4(a)', '5': '2S1:5', '6': '2S2:2', '7': '2P6,2,1', '8': '2PG1:2', '9': '3H3', '0': '~gldr', \
                        's+1': '3G2:4', 's+2': '3GG2', 's+3': 'K5(4,1)', 's+4': 'K7(4,3)', 's+5': 'K9(5,4)', 's+6': '3R5', 's+7': '4R6', 's+8': '2D10', 's+9': '4F12',

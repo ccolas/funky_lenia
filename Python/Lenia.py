@@ -1230,6 +1230,7 @@ class Lenia:
 
     def process_key(self, k):
         global STATUS
+
         inc_or_dec = 1 if 's+' not in k else -1
         inc_10_or_1 = (10 if 's+' not in k else 1) if 'c+' not in k else 0
         inc_big_or_not = 0 if 'c+' not in k else 1
@@ -1510,8 +1511,7 @@ class Lenia:
 
     def update_midi_controls(self, controls):
         CONTROLS = [13, 14, 15, 16, 17, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 36, 49, 50, 51, 52, 53, 54, 55, 56, 77, 78, 79, 80, 81, 82, 83, 84]
-        RANGE_B = np.arange(0, 1, 1/127)
-        unique_controls = set(controls)
+        RANGE_B = np.arange(0, 1.001, 1/127)
         for control, value in controls.items():
             if control == 13:
                 self.world.params['m'] = RANGE_MU[value]
@@ -1522,10 +1522,16 @@ class Lenia:
             elif control == 20:
                 self.world.params['b'][0] = RANGE_B[value]
             elif control == 36:
+                while len(self.world.params['b']) < 2:
+                    self.world.params['b'].append(0)
                 self.world.params['b'][1] = RANGE_B[value]
             elif control == 56:
+                while len(self.world.params['b']) < 3:
+                    self.world.params['b'].append(0)
                 self.world.params['b'][2] = RANGE_B[value]
-
+        if 20 in controls.keys() or 36 in controls.keys() or 56 in controls.keys():
+            self.automaton.calc_once(is_update=False)
+            self.automaton.calc_kernel()
 
         self.analyzer.new_segment()
         self.check_auto_load()
@@ -1538,15 +1544,21 @@ class Lenia:
     def update_midi_notes(self, notes):
         NOTES = [89, 90, 73, 41, 42, 43, 74, 75, 44, 76, 91, 92, 57, 58, 59, 60]
 
-        for notes in note:
-            if note == 89:
+        for note in notes:
+            print(note)
+            if note == 41:
                 # change kernel
-                self.automaton.kn = (self.automaton.kn + inc_or_dec - 1) % len(self.automaton.kernel_core) + 1;
+                self.automaton.kn = (self.automaton.kn + 1) % len(self.automaton.kernel_core) + 1
                 self.info_type = 'kn'
-            elif note == 90:
+                self.automaton.calc_once(is_update=False)
+                self.automaton.calc_kernel()
+
+            elif note == 42:
                 # change growth function
-                self.automaton.gn = (self.automaton.gn + inc_or_dec - 1) % len(self.automaton.field_func) + 1;
+                self.automaton.gn = (self.automaton.gn + 1) % len(self.automaton.field_func) + 1
                 self.info_type = 'gn'
+                self.automaton.calc_once(is_update=False)
+                self.automaton.calc_kernel()
 
             elif note == 73:
                 # change animal to random
@@ -1795,7 +1807,7 @@ class Lenia:
                     if self.run_counter == 0:
                         self.is_run = False
             if counter % self.show_freq == 0:
-                self.update_info_bar()
+                #self.update_info_bar()
                 self.update_win()
 
 

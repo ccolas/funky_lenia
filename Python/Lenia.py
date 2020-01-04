@@ -25,7 +25,7 @@ RANGE_MU = np.arange(MU - DELTA_MU, MU + DELTA_MU, 2 * DELTA_MU / 128)
 
 DELTA_SIGMA = 0.001
 SIGMA = 0.01
-RANGE_MU = np.arange(SIGMA - DELTA_SIGMA, SIGMA + DELTA_SIGMA, 2 * DELTA_SIGMA / 128)
+RANGE_SIGMA = np.arange(SIGMA - DELTA_SIGMA, SIGMA + DELTA_SIGMA, 2 * DELTA_SIGMA / 128)
 
 warnings.filterwarnings('ignore', '.*output shape of zoom.*')  # suppress warning from scipy.ndimage.zoom()
 
@@ -1544,7 +1544,7 @@ class Lenia:
         self.analyzer.new_segment()
         self.check_auto_load()
 
-        if not is_ignore and self.is_loop:
+        if self.is_loop:
             self.roundup(self.world.params)
             self.roundup(self.tx)
             self.automaton.calc_once(is_update=False)
@@ -1755,10 +1755,10 @@ class Lenia:
                     notes.append(msg.note)
 
             if len(controls.keys()) > 0:
-                update_midi_controls(controls)
+                self.update_midi_controls(controls)
 
             if len(notes) > 0:
-                update_midi_notes(notes)
+                self.update_midi_notes(notes)
 
             if self.is_empty:
                 self.load_animal_id(np.random.randint(len(self.animal_data)))
@@ -1794,7 +1794,7 @@ if __name__ == '__main__':
     lenia = Lenia()
     lenia.load_animal_code(lenia.ANIMAL_KEY_LIST['2'])
     # lenia.update_menu()
-    lenia.loop(midi_port)
+    lenia.loop()
 
 ''' for PyOpenCL in Windows:
 install Intel OpenCL SDK

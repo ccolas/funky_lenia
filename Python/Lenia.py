@@ -27,6 +27,8 @@ DELTA_SIGMA = 0.001
 SIGMA = 0.01
 RANGE_SIGMA = np.arange(SIGMA - DELTA_SIGMA, SIGMA + DELTA_SIGMA, 2 * DELTA_SIGMA / 128)
 
+T = 10
+RANGE_T = np.arange(2, 50, (50 - 2) / 128)
 warnings.filterwarnings('ignore', '.*output shape of zoom.*')  # suppress warning from scipy.ndimage.zoom()
 
 X2, Y2, P2, PIXEL_BORDER = 9, 9, 1, 0  # GoL 6,6,3,1   Lenia Lo 7,7,2,0  Hi 9,9,0,0   1<<9=512
@@ -44,7 +46,7 @@ is_windows = (os.name == 'nt')
 class Board:
     def __init__(self, size=[0, 0]):
         self.names = ['', '', '']
-        self.params = {'R': DEF_R, 'T': 10, 'b': [1], 'm': 0.1, 's': 0.01, 'kn': 1, 'gn': 1}
+        self.params = {'R': DEF_R, 'T': 10, 'b': [1, 0, 0], 'm': 0.1, 's': 0.01, 'kn': 1, 'gn': 1}
         self.param_P = 0
         self.cells = np.zeros(size)
 
@@ -1505,41 +1507,25 @@ class Lenia:
         state = 'normal' if key or animal_id else tk.DISABLED
         return {'accelerator': acc, 'command': func, 'state': state}
 
-    # def create_submenu(self, parent, items):
-    # 	m = tk.Menu(parent, tearoff=True)
-    # 	m.seq = 0
-    # 	for i in items:
-    # 		m.seq += 1
-    # 		if i is None or i=='':
-    # 			m.add_separator()
-    # 		elif type(i) in [tuple, list]:
-    # 			m.add_cascade(label=i[0], menu=self.create_submenu(m, i[1]))
-    # 		else:
-    # 			first, text, key, acc, *_ = i.split('|') + ['']*2
-    # 			kind, name = first[:1], first[1:]
-    # 			if first=='':
-    # 				m.add_command(label=text, **self.get_acc_func(key, acc))
-    # 			elif kind=='^':
-    # 				self.menu_vars[name] = tk.BooleanVar(value=self.get_nested_attr(name))
-    # 				m.add_checkbutton(label=text, variable=self.menu_vars[name], **self.get_acc_func(key, acc))
-    # 			elif kind=='@':
-    # 				self.menu_values[name] = (m._name, m.seq, text)
-    # 				m.add_command(label='', **self.get_acc_func(key, acc)) # background='dark green', foreground='white'
-    # 			elif kind=='#':
-    # 				self.menu_params[name] = (m._name, m.seq, text)
-    # 				m.add_command(label='', state=tk.DISABLED) # background='navy', foreground='white')
-    # 			elif kind=='&':
-    # 				m.add_command(label=text, **self.get_acc_func(key, acc, animal_id=name))
-    # 	return m
 
     def update_midi_controls(self, controls):
-
+        CONTROLS = [13, 14, 15, 16, 17, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 36, 49, 50, 51, 52, 53, 54, 55, 56, 77, 78, 79, 80, 81, 82, 83, 84]
+        RANGE_B = np.arange(0, 1, 1/127)
         unique_controls = set(controls)
         for control, value in controls.items():
             if control == 13:
                 self.world.params['m'] = RANGE_MU[value]
             elif control == 14:
                 self.world.params['s'] = RANGE_SIGMA[value]
+            elif control == 15:
+                self.world.params['T'] = RANGE_T[value]
+            elif control == 20:
+                self.world.params['b'][0] = RANGE_B[value]
+            elif control == 36:
+                self.world.params['b'][1] = RANGE_B[value]
+            elif control == 56:
+                self.world.params['b'][2] = RANGE_B[value]
+
 
         self.analyzer.new_segment()
         self.check_auto_load()
@@ -1550,7 +1536,30 @@ class Lenia:
             self.automaton.calc_once(is_update=False)
 
     def update_midi_notes(self, notes):
-        pass
+        NOTES = [89, 90, 73, 41, 42, 43, 74, 75, 44, 76, 91, 92, 57, 58, 59, 60]
+
+        for notes in note:
+            if note == 89:
+                # change kernel
+                self.automaton.kn = (self.automaton.kn + inc_or_dec - 1) % len(self.automaton.kernel_core) + 1;
+                self.info_type = 'kn'
+            elif note == 90:
+                # change growth function
+                self.automaton.gn = (self.automaton.gn + inc_or_dec - 1) % len(self.automaton.field_func) + 1;
+                self.info_type = 'gn'
+
+            elif note == 73:
+                # change animal to random
+                self.load_animal_id(np.random.randint(len(self.animal_data)))
+
+        self.analyzer.new_segment()
+        self.check_auto_load()
+
+        if self.is_loop:
+            self.roundup(self.world.params)
+            self.roundup(self.tx)
+            self.automaton.calc_once(is_update=False)
+
 
     def get_animal_nested_list(self):
         root = []

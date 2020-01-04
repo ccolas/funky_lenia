@@ -4,6 +4,7 @@ import scipy.ndimage as snd
 import reikna.fft, reikna.cluda  # pip3 install pyopencl/pycuda, reikna
 import PIL.Image, PIL.ImageTk  # pip3 install pillow
 import PIL.ImageDraw, PIL.ImageFont
+import mido
 
 try:
     import tkinter as tk
@@ -13,6 +14,18 @@ from fractions import Fraction
 import copy, re, itertools, json, csv
 import io, os, sys, subprocess, datetime, time, multiprocessing
 import warnings
+
+CONTROLS = [13, 14, 15, 16, 17, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 36, 49, 50, 51, 52, 53, 54, 55, 56, 77, 78, 79, 80, 81, 82, 83, 84]
+NOTES = [89, 90, 73, 41, 42, 43, 74, 75, 44, 76, 91, 92, 57, 58, 59, 60]
+MIDI_PORT = mido.open_input()
+
+DELTA_MU = 0.01
+MU = 0.1
+RANGE_MU = np.arange(MU - DELTA_MU, MU + DELTA_MU, 2 * DELTA_MU / 128)
+
+DELTA_SIGMA = 0.001
+SIGMA = 0.01
+RANGE_MU = np.arange(SIGMA - DELTA_SIGMA, SIGMA + DELTA_SIGMA, 2 * DELTA_SIGMA / 128)
 
 warnings.filterwarnings('ignore', '.*output shape of zoom.*')  # suppress warning from scipy.ndimage.zoom()
 
@@ -1519,6 +1532,26 @@ class Lenia:
     # 				m.add_command(label=text, **self.get_acc_func(key, acc, animal_id=name))
     # 	return m
 
+    def update_midi_controls(self, controls):
+
+        unique_controls = set(controls)
+        for control, value in controls.items():
+            if control == 13:
+                self.world.params['m'] = RANGE_MU[value]
+            elif control == 14:
+                self.world.params['s'] = RANGE_SIGMA[value]
+
+        self.analyzer.new_segment()
+        self.check_auto_load()
+
+        if not is_ignore and self.is_loop:
+            self.roundup(self.world.params)
+            self.roundup(self.tx)
+            self.automaton.calc_once(is_update=False)
+
+    def update_midi_notes(self, notes):
+        pass
+
     def get_animal_nested_list(self):
         root = []
         stack = [root]
@@ -1705,10 +1738,28 @@ class Lenia:
             self.recorder.finish_record()
         self.win.destroy()
 
+
     def run(self):
+
         counter = 0
         while self.is_loop:
             counter += 1
+
+            controls = dict()
+            notes = []
+            for msg in MIDI_PORT.iter_pending():
+                print(msg)
+                try:
+                    controls[msg.control] = msg.value
+                except:
+                    notes.append(msg.note)
+
+            if len(controls.keys()) > 0:
+                update_midi_controls(controls)
+
+            if len(notes) > 0:
+                update_midi_notes(notes)
+
             if self.is_empty:
                 self.load_animal_id(np.random.randint(len(self.animal_data)))
                 self.is_empty = False
@@ -1743,7 +1794,7 @@ if __name__ == '__main__':
     lenia = Lenia()
     lenia.load_animal_code(lenia.ANIMAL_KEY_LIST['2'])
     # lenia.update_menu()
-    lenia.loop()
+    lenia.loop(midi_port)
 
 ''' for PyOpenCL in Windows:
 install Intel OpenCL SDK

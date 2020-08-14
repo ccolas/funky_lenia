@@ -94,7 +94,7 @@ class Board:
         ''' RLE = Run-length encoding:
             http://www.conwaylife.com/w/index.php?title=Run_Length_Encoded
             http://golly.sourceforge.net/Help/formats.html#rle
-            https://www.rosettacode.org/wiki/Run-length_encoding#Python
+            https://www.rosettacode.org/wiki/Run-length_encoding#src
             0=b=.  1=o=A  1-24=A-X  25-48=pA-pX  49-72=qA-qX  241-255=yA-yO '''
         V = np.rint(A * 255).astype(int).tolist()  # [[255 255] [255 0]]
         code_arr = [[' .' if v == 0 else ' ' + chr(ord('A') + v - 1) if v < 25 else chr(ord('p') + (v - 25) // 24) + chr(ord('A') + (v - 25) % 24) for v in row] for row in

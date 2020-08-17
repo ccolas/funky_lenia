@@ -17,7 +17,6 @@ warnings.filterwarnings('ignore', '.*nperseg.*') # suppress warning from scipy.s
 
 parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, 
 description='''Lenia in n-Dimensions    by Bert Chan 2020
-
 recommanded settings: (2D) -d2 -p2, (wide) -d2 -p0 -w 10 9, (3D) -d3 -p3, (4D) -d4 -p4''')
 parser.add_argument('-d', '--dim', dest='D', default=2, action='store', type=int, help='number of dimensions (default 2D)')
 group = parser.add_mutually_exclusive_group(required=False)

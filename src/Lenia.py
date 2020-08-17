@@ -1,602 +1,20 @@
 import numpy as np  # pip3 install numpy
-import scipy  # pip3 install scipy
-import scipy.ndimage as snd
 import reikna.fft, reikna.cluda  # pip3 install pyopencl/pycuda, reikna
 import PIL.Image, PIL.ImageTk  # pip3 install pillow
 import PIL.ImageDraw, PIL.ImageFont
-import mido
+from src.board import Board
+from src.automaton import Automaton
+from src.analyzer import Analyzer
+from src.recorder import Recorder
 
 try:
     import tkinter as tk
 except:
     import Tkinter as tk
 from fractions import Fraction
-import copy, re, itertools, json, csv
-import io, os, sys, subprocess, datetime, time, multiprocessing
-import warnings
-
-CONTROLS = [13, 14, 15, 16, 17, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 36, 49, 50, 51, 52, 53, 54, 55, 56, 77, 78, 79, 80, 81, 82, 83, 84]
-NOTES = [89, 90, 73, 41, 42, 43, 74, 75, 44, 76, 91, 92, 57, 58, 59, 60]
-MIDI_PORT = mido.open_input()
-
-DELTA_MU = 0.01
-MU = 0.1
-RANGE_MU = np.arange(MU - DELTA_MU, MU + DELTA_MU, 2 * DELTA_MU / 128)
-
-DELTA_SIGMA = 0.001
-SIGMA = 0.01
-RANGE_SIGMA = np.arange(SIGMA - DELTA_SIGMA, SIGMA + DELTA_SIGMA, 2 * DELTA_SIGMA / 128)
-
-T = 10
-RANGE_T = np.arange(2, 50, (50 - 2) / 128)
-warnings.filterwarnings('ignore', '.*output shape of zoom.*')  # suppress warning from scipy.ndimage.zoom()
-
-X2, Y2, P2, PIXEL_BORDER = 9, 9, 1, 0  # GoL 6,6,3,1   Lenia Lo 7,7,2,0  Hi 9,9,0,0   1<<9=512
-SIZEX, SIZEY, PIXEL = 1 << X2, 1 << Y2, 1 << P2
-# PIXEL, PIXEL_BORDER = 1,0; SIZEX, SIZEY = 1280//PIXEL, 720//PIXEL    # 720p HD
-# PIXEL, PIXEL_BORDER = 1,0; SIZEX, SIZEY = 1920//PIXEL, 1080//PIXEL    # 1080p HD
-MIDX, MIDY = int(SIZEX / 2), int(SIZEY / 2)
-DEF_R = max(min(SIZEX, SIZEY) // 4 // 5 * 5, 13)
-EPSILON = 1e-10
-ROUND = 10
-STATUS = []
-is_windows = (os.name == 'nt')
-
-
-class Board:
-    def __init__(self, size=[0, 0]):
-        self.names = ['', '', '']
-        self.params = {'R': DEF_R, 'T': 10, 'b': [1, 0, 0], 'm': 0.1, 's': 0.01, 'kn': 1, 'gn': 1}
-        self.param_P = 0
-        self.cells = np.zeros(size)
-
-    @classmethod
-    def from_values(cls, cells, params=None, names=None):
-        self = cls()
-        self.names = names.copy() if names is not None else None
-        self.params = params.copy() if params is not None else None
-        self.cells = cells.copy() if cells is not None else None
-        return self
-
-    @classmethod
-    def from_data(cls, data):
-        self = cls()
-        self.names = [data.get('code', ''), data.get('name', ''), data.get('cname', '')]
-        self.params = data.get('params')
-        if self.params:
-            self.params = self.params.copy()
-            self.params['b'] = Board.st2fracs(self.params['b'])
-        self.cells = data.get('cells')
-        if self.cells:
-            if type(self.cells) in [tuple, list]:
-                self.cells = ''.join(self.cells)
-            self.cells = Board.rle2arr(self.cells)
-        return self
-
-    def to_data(self, is_shorten=True):
-        rle_st = Board.arr2rle(self.cells, is_shorten)
-        params2 = self.params.copy()
-        params2['b'] = Board.fracs2st(params2['b'])
-        data = {'code': self.names[0], 'name': self.names[1], 'cname': self.names[2], 'params': params2, 'cells': rle_st}
-        return data
-
-    def params2st(self):
-        params2 = self.params.copy()
-        params2['b'] = '[' + Board.fracs2st(params2['b']) + ']'
-        return ','.join(['{}={}'.format(k, str(v)) for (k, v) in params2.items()])
-
-    def long_name(self):
-        # return ' | '.join(filter(None, self.names))
-        return '{0} - {1} {2}'.format(*self.names)
-
-    @staticmethod
-    def arr2rle(A, is_shorten=True):
-        ''' RLE = Run-length encoding:
-            http://www.conwaylife.com/w/index.php?title=Run_Length_Encoded
-            http://golly.sourceforge.net/Help/formats.html#rle
-            https://www.rosettacode.org/wiki/Run-length_encoding#src
-            0=b=.  1=o=A  1-24=A-X  25-48=pA-pX  49-72=qA-qX  241-255=yA-yO '''
-        V = np.rint(A * 255).astype(int).tolist()  # [[255 255] [255 0]]
-        code_arr = [[' .' if v == 0 else ' ' + chr(ord('A') + v - 1) if v < 25 else chr(ord('p') + (v - 25) // 24) + chr(ord('A') + (v - 25) % 24) for v in row] for row in
-                    V]  # [[yO yO] [yO .]]
-        if is_shorten:
-            rle_groups = [[(len(list(g)), c.strip()) for c, g in itertools.groupby(row)] for row in code_arr]  # [[(2 yO)] [(1 yO) (1 .)]]
-            for row in rle_groups:
-                if row[-1][1] == '.': row.pop()  # [[(2 yO)] [(1 yO)]]
-            st = '$'.join(''.join([(str(n) if n > 1 else '') + c for n, c in row]) for row in rle_groups) + '!'  # "2 yO $ 1 yO"
-        else:
-            st = '$'.join(''.join(row) for row in code_arr) + '!'
-        # print(sum(sum(r) for r in V))
-        return st
-
-    @staticmethod
-    def rle2arr(st):
-        rle_groups = re.findall('(\d*)([p-y]?[.boA-X$])', st.rstrip('!'))  # [(2 yO)(1 $)(1 yO)]
-        code_list = sum([[c] * (1 if n == '' else int(n)) for n, c in rle_groups], [])  # [yO yO $ yO]
-        code_arr = [l.split(',') for l in ','.join(code_list).split('$')]  # [[yO yO] [yO]]
-        V = [[0 if c in ['.', 'b'] else 255 if c == 'o' else ord(c) - ord('A') + 1 if len(c) == 1 else (ord(c[0]) - ord('p')) * 24 + (ord(c[1]) - ord('A') + 25) for c in row if
-              c != ''] for row in code_arr]  # [[255 255] [255]]
-        # lines = st.rstrip('!').split('$')
-        # rle = [re.findall('(\d*)([p-y]?[.boA-X])', row) for row in lines]
-        # code = [ sum([[c] * (1 if n=='' else int(n)) for n,c in row], []) for row in rle]
-        # V = [ [0 if c in ['.','b'] else 255 if c=='o' else ord(c)-ord('A')+1 if len(c)==1 else (ord(c[0])-ord('p'))*24+(ord(c[1])-ord('A')+25) for c in row ] for row in code]
-        maxlen = len(max(V, key=len))
-        A = np.array([row + [0] * (maxlen - len(row)) for row in V]) / 255  # [[1 1] [1 0]]
-        # print(sum(sum(r) for r in V))
-        return A
-
-    @staticmethod
-    def fracs2st(B):
-        return ','.join([str(f) for f in B])
-
-    @staticmethod
-    def st2fracs(st):
-        return [Fraction(st) for st in st.split(',')]
-
-    def clear(self):
-        self.cells.fill(0)
-
-    def add(self, part, shift=[0, 0]):
-        # assert self.params['R'] == part.params['R']
-        h1, w1 = self.cells.shape
-        h2, w2 = part.cells.shape
-        h, w = min(h1, h2), min(w1, w2)
-        i1, j1 = (w1 - w) // 2 + shift[1], (h1 - h) // 2 + shift[0]
-        i2, j2 = (w2 - w) // 2, (h2 - h) // 2
-        # self.cells[j:j+h, i:i+w] = part.cells[0:h, 0:w]
-        vmin = np.amin(part.cells)
-        for y in range(h):
-            for x in range(w):
-                if part.cells[j2 + y, i2 + x] > vmin:
-                    self.cells[(j1 + y) % h1, (i1 + x) % w1] = part.cells[j2 + y, i2 + x]
-        return self
-
-    def transform(self, tx, mode='RZSF', is_world=False):
-        if 'R' in mode and tx['rotate'] != 0:
-            self.cells = scipy.ndimage.rotate(self.cells, tx['rotate'], reshape=not is_world, order=0, mode='wrap' if is_world else 'constant')
-        if 'Z' in mode and tx['R'] != self.params['R']:
-            # print('* {} / {}'.format(tx['R'], self.params['R']))
-            shape_orig = self.cells.shape
-            self.cells = scipy.ndimage.zoom(self.cells, tx['R'] / self.params['R'], order=0)
-            if is_world:
-                self.cells = Board(shape_orig).add(self).cells
-            self.params['R'] = tx['R']
-        if 'F' in mode and tx['flip'] != -1:
-            if tx['flip'] in [0, 1]:
-                self.cells = np.flip(self.cells, axis=tx['flip'])
-            elif tx['flip'] == 2:
-                self.cells[:, :-MIDX - 1:-1] = self.cells[:, :MIDX]
-            elif tx['flip'] == 3:
-                self.cells[:, :-MIDX - 1:-1] = self.cells[::-1, :MIDX]
-            elif tx['flip'] == 4:
-                i_upper = np.triu_indices(SIZEX, -1); self.cells[i_upper] = self.cells.T[i_upper]
-        if 'S' in mode and tx['shift'] != [0, 0]:
-            self.cells = scipy.ndimage.shift(self.cells, tx['shift'], order=0, mode='wrap')
-        # self.cells = np.roll(self.cells, tx['shift'], (1, 0))
-        return self
-
-    def add_transformed(self, part, tx):
-        part = copy.deepcopy(part)
-        self.add(part.transform(tx, mode='RZF'), tx['shift'])
-        return self
-
-    def crop(self):
-        vmin = np.amin(self.cells)
-        coords = np.argwhere(self.cells > vmin)
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1
-        self.cells = self.cells[y0:y1, x0:x1]
-        return self
-
-    def restore_to(self, dest):
-        dest.params = self.params.copy()
-        dest.cells = self.cells.copy()
-        dest.names = self.names.copy()
-
-
-class Automaton:
-    kernel_core = {
-        0: lambda r: (4 * r * (1 - r)) ** 4,  # polynomial (quad4)
-        1: lambda r: np.exp(4 - 1 / (r * (1 - r))),  # exponential / gaussian bump (bump4)
-        2: lambda r, q=1 / 4: (r >= q) * (r <= 1 - q),  # step (stpz1/4)
-        3: lambda r, q=1 / 4: (r >= q) * (r <= 1 - q) + (r < q) * 0.5  # staircase (life)
-    }
-    field_func = {
-        0: lambda n, m, s: np.maximum(0, 1 - (n - m) ** 2 / (9 * s ** 2)) ** 4 * 2 - 1,  # polynomial (quad4)
-        1: lambda n, m, s: np.exp(- (n - m) ** 2 / (2 * s ** 2)) * 2 - 1,  # exponential / gaussian (gaus)
-        2: lambda n, m, s: (np.abs(n - m) <= s) * 2 - 1  # step (stpz)
-    }
-
-    def __init__(self, world):
-        self.world = world
-        self.world_FFT = np.zeros(world.cells.shape)
-        self.potential_FFT = np.zeros(world.cells.shape)
-        self.potential = np.zeros(world.cells.shape)
-        self.field = np.zeros(world.cells.shape)
-        self.field_old = None
-        self.change = np.zeros(world.cells.shape)
-        self.X = None
-        self.Y = None
-        self.D = None
-        self.gen = 0
-        self.time = 0
-        self.is_multi_step = False
-        self.is_soft_clip = False
-        self.is_inverted = False
-        self.kn = 1
-        self.gn = 1
-        self.is_gpu = True
-        self.has_gpu = True
-        self.compile_gpu(self.world.cells)
-        self.calc_kernel()
-
-    def kernel_shell(self, r):
-        B = len(self.world.params['b'])
-        Br = B * r
-        bs = np.array([float(f) for f in self.world.params['b']])
-        b = bs[np.minimum(np.floor(Br).astype(int), B - 1)]
-        kfunc = Automaton.kernel_core[(self.world.params.get('kn') or self.kn) - 1]
-        return (r < 1) * kfunc(np.minimum(Br % 1, 1)) * b
-
-    @staticmethod
-    def soft_max(x, m, k):
-        ''' Soft maximum: https://www.johndcook.com/blog/2010/01/13/soft-maximum/ '''
-        return np.log(np.exp(k * x) + np.exp(k * m)) / k
-
-    @staticmethod
-    def soft_clip(x, min, max, k):
-        a = np.exp(k * x)
-        b = np.exp(k * min)
-        c = np.exp(-k * max)
-        return np.log(1 / (a + b) + c) / -k
-
-    # return Automaton.soft_max(Automaton.soft_max(x, min, k), max, -k)
-
-    def compile_gpu(self, A):
-        ''' Reikna: http://reikna.publicfields.net/en/latest/api/computations.html '''
-        self.gpu_api = self.gpu_thr = self.gpu_fft = self.gpu_fftshift = None
-        try:
-            self.gpu_api = reikna.cluda.any_api()
-            self.gpu_thr = self.gpu_api.Thread.create()
-            self.gpu_fft = reikna.fft.FFT(A.astype(np.complex64)).compile(self.gpu_thr)
-            self.gpu_fftshift = reikna.fft.FFTShift(A.astype(np.float32)).compile(self.gpu_thr)
-        except Exception as exc:
-            # if str(exc) == "No supported GPGPU APIs found":
-            self.has_gpu = False
-            self.is_gpu = False
-            print(exc)
-        # raise exc
-
-    def run_gpu(self, A, cpu_func, gpu_func, dtype, **kwargs):
-        if self.is_gpu and self.gpu_thr and gpu_func:
-            op_dev = self.gpu_thr.to_device(A.astype(dtype))
-            gpu_func(op_dev, op_dev, **kwargs)
-            return op_dev.get()
-        else:
-            return cpu_func(A)
-        # return np.roll(potential_shifted, (MIDX, MIDY), (1, 0))
-
-    def fft(self, A):
-        return self.run_gpu(A, np.fft.fft2, self.gpu_fft, np.complex64)
-
-    def ifft(self, A):
-        return self.run_gpu(A, np.fft.ifft2, self.gpu_fft, np.complex64, inverse=True)
-
-    def fftshift(self, A):
-        return self.run_gpu(A, np.fft.fftshift, self.gpu_fftshift, np.float32)
-
-    def calc_once(self, is_update=True):
-        A = self.world.cells
-        dt = 1 / self.world.params['T']
-        self.world_FFT = self.fft(A)
-        self.potential_FFT = self.kernel_FFT * self.world_FFT
-        self.potential = self.fftshift(np.real(self.ifft(self.potential_FFT)))
-        gfunc = Automaton.field_func[(self.world.params.get('gn') or self.gn) - 1]
-        # m = (np.random.rand(SIZEY, SIZEX) * 0.4 + 0.8) * self.world.params['m']
-        # s = (np.random.rand(SIZEY, SIZEX) * 0.4 + 0.8) * self.world.params['s']
-        m, s = self.world.params['m'], self.world.params['s']
-        self.field = gfunc(self.potential, m, s)
-        if self.is_multi_step and self.field_old:
-            D = 1 / 2 * (3 * self.field - self.field_old)
-            self.field_old = self.field.copy()
-        else:
-            D = self.field
-        if not self.is_soft_clip:
-            A_new = np.clip(A + dt * D, 0, 1)  # A_new = A + dt * np.clip(D, -A/dt, (1-A)/dt)
-        else:
-            A_new = Automaton.soft_clip(A + dt * D, 0, 1, 1 / dt)  # A_new = A + dt * Automaton.soft_clip(D, -A/dt, (1-A)/dt, 1)
-        if self.world.param_P > 0:
-            A_new = np.around(A_new * self.world.param_P) / self.world.param_P
-        self.change = (A_new - A) / dt
-        if is_update:
-            self.world.cells = A_new
-            self.gen += 1
-            self.time = round(self.time + dt, ROUND)
-        if self.is_gpu:
-            self.gpu_thr.synchronize()
-
-    def calc_kernel(self):
-        I, J = np.meshgrid(np.arange(SIZEX), np.arange(SIZEY))
-        self.X = (I - MIDX) / self.world.params['R']
-        self.Y = (J - MIDY) / self.world.params['R']
-        self.D = np.sqrt(self.X ** 2 + self.Y ** 2)
-
-        self.kernel = self.kernel_shell(self.D)
-        self.kernel_sum = self.kernel.sum()
-        kernel_norm = self.kernel / self.kernel_sum
-        self.kernel_FFT = self.fft(kernel_norm)
-        self.kernel_updated = False
-
-    def reset(self):
-        self.gen = 0
-        self.time = 0
-        self.field_old = None
-
-
-class Analyzer:
-    STAT_NAMES = {'p_m': 'Param m', 'p_s': 'Param s', 'n': 'Gen (#)', 't': 'Time (s)',
-                  'm': 'Mass (mg)', 'g': 'Growth (mg/s)', 'r': 'Gyradius (mm)',  # 'I':'Moment of inertia'
-                  'd': 'Mass-growth distance (mm)', 's': 'Speed (mm/s)', 'w': 'Angular speed (deg/s)',
-                  'm_a': 'Mass asymmetry (mg)'}  # 'm_r':'Mass on right (mg)', 'm_l':'Mass on left (mg)'
-    # 'a':'Semi-major axis (mm)', 'b':'Semi-minor axis (mm)', 'e':'Eccentricity', 'c':'Compactness', 'w_th':'Shape angular speed (deg/s)'}
-    STAT_HEADERS = ['p_m', 'p_s', 'n', 't', 'm', 'g', 'r', 'd', 's', 'w', 'm_a']  # 'm_r', 'm_l'
-    # , 'a', 'b', 'e', 'c', 'w_th']
-    SEGMENT_LEN = 20
-
-    def get_stat_row(self):
-        R, T, pm, ps = [self.world.params[k] for k in ('R', 'T', 'm', 's')]
-        return [pm, ps, self.automaton.gen, self.automaton.time,
-                self.mass / R / R, self.growth / R / R, np.sqrt(self.inertia / self.mass),  # self.inertia/R/R  # self.inertia*R*R,
-                self.mg_dist, self.m_shift * T, self.m_rotate * T, self.mass_asym / R / R, self.mass_right / R / R, self.mass_left / R / R]
-
-    # self.shape_major_axis, self.shape_minor_axis,
-    # self.shape_eccentricity, self.shape_compactness, self.shape_rotate]
-
-    def __init__(self, automaton):
-        self.automaton = automaton
-        self.world = self.automaton.world
-        # self.aaa = self.world.cells
-        self.is_trim_segment = True
-        self.reset()
-
-    def reset_counters(self):
-        self.is_empty = False
-        self.is_full = False
-        self.mass = 0
-        self.growth = 0
-        self.inertia = 0
-        self.m_center = None
-        self.g_center = None
-        self.mg_dist = 0
-        self.m_shift = 0
-        self.m_angle = 0
-        self.m_rotate = 0
-        self.mass_asym = 0
-        self.mass_right = 0
-        self.mass_left = 0
-
-    # self.shape_major_axis = 0
-    # self.shape_minor_axis = 0
-    # self.shape_eccentricity = 0
-    # self.shape_compactness = 0
-    # self.shape_angle = 0
-    # self.shape_rotate = 0
-
-    def reset_last(self):
-        self.m_last_center = None
-        self.m_center = None
-        self.m_last_angle = None
-
-    # self.shape_last_angle = None
-
-    def reset(self):
-        self.reset_counters()
-        self.reset_last()
-        self.clear_series()
-        self.last_shift_idx = np.zeros(2)
-        self.total_shift_idx = np.zeros(2)
-
-    def calc_stats(self):
-        self.m_last_center = self.m_center
-        self.m_last_angle = self.m_angle
-        # self.shape_last_angle = self.shape_angle
-        self.reset_counters()
-
-        R, T = [self.world.params[k] for k in ('R', 'T')]
-        A = self.world.cells
-        G = np.maximum(self.automaton.field, 0)
-        h, w = A.shape
-        X, Y = self.automaton.X, self.automaton.Y
-        m00 = self.mass = A.sum()
-        g00 = self.growth = G.sum()
-        self.is_empty = (self.mass < EPSILON)
-        self.is_full = (A[0, :].sum() + A[h - 1, :].sum() + A[:, 0].sum() + A[:, w - 1].sum() > 0)
-
-        if m00 > EPSILON:
-            AX, AY = A * X, A * Y
-            m10, m01 = AX.sum(), AY.sum()
-            m20, m02 = (AX * X).sum(), (AY * Y).sum()
-            mx, my = self.m_center = np.array([m10, m01]) / m00
-            mu20, mu02 = m20 - mx * m10, m02 - my * m01
-            self.inertia = mu20 + mu02
-            # self.inertia = (mu20 + mu02) / m00**2
-
-            # m11 = (AY*X).sum()
-            # mu11 = m11 - mx * m10
-            # m1 = mu20 + mu02
-            # m2 = mu20 - mu02
-            # m3 = 2 * mu11
-            # t1 = m1 / 2 / m00
-            # t2 = np.sqrt(m2**2 + m3**2) / 2 / m00
-            # self.shape_major_axis = t1 + t2
-            # self.shape_minor_axis = t1 - t2
-            # self.shape_eccentricity = np.sqrt(1 - self.shape_minor_axis / self.shape_major_axis)
-            # self.shape_compactness = m00 / (mu20 + mu02)
-            # self.shape_angle = np.degrees(np.arctan2(m2, m3))
-            # if self.shape_last_angle is not None:
-            # self.shape_rotate = self.shape_angle - self.shape_last_angle
-            # self.shape_rotate = (self.shape_rotate + 540) % 360 - 180
-
-            if g00 > EPSILON:
-                g01, g10 = (G * X).sum(), (G * Y).sum()
-                gx, gy = self.g_center = np.array([g01, g10]) / g00
-                self.mg_dist = np.linalg.norm(self.m_center - self.g_center)
-
-            if self.m_last_center is not None and self.m_last_angle is not None:
-                dm = self.m_center - self.m_last_center + self.last_shift_idx / R
-                self.m_shift = np.linalg.norm(dm)
-                self.m_angle = np.degrees(np.arctan2(dm[1], dm[0])) if self.m_shift >= EPSILON else 0
-                self.m_rotate = self.m_angle - self.m_last_angle
-                self.m_rotate = (self.m_rotate + 540) % 360 - 180
-                if self.automaton.gen <= 2:
-                    self.m_rotate = 0
-
-                midpoint = np.array([MIDX, MIDY])
-                X, Y = np.meshgrid(np.arange(SIZEX), np.arange(SIZEY))
-                x0, y0 = self.m_last_center * R + midpoint - self.last_shift_idx
-                x1, y1 = self.m_center * R + midpoint
-                sign = (x1 - x0) * (Y - y0) - (y1 - y0) * (X - x0)
-                self.mass_right = (A[sign > 0]).sum()
-                self.mass_left = (A[sign < 0]).sum()
-                self.mass_asym = self.mass_right - self.mass_left
-            # self.aaa = A.copy(); self.aaa[sign<0] = 0
-
-    def stat_name(self, i=None, x=None):
-        if not x: x = self.STAT_HEADERS[i]
-        return '{0}={1}'.format(x, self.STAT_NAMES[x])
-
-    def new_segment(self):
-        if self.series == [] or self.series[-1] != []:
-            self.series.append([])
-
-    def clear_segment(self):
-        if self.series != []:
-            if self.series[-1] == []:
-                self.series.pop()
-            if self.series != []:
-                self.series[-1] = []
-
-    def invalidate_segment(self):
-        if self.series != []:
-            self.series[-1] = [[self.world.params['m'], self.world.params['s']] + [np.nan] * (len(self.STAT_HEADERS) - 2)]
-            self.new_segment()
-
-    def clear_series(self):
-        self.series = []
-
-    def add_stats(self):
-        if self.series == []:
-            self.new_segment()
-        segment = self.series[-1]
-        v = self.get_stat_row()
-        segment.append(v)
-        if self.is_trim_segment:
-            while len(segment) > self.SEGMENT_LEN * self.world.params['T']:
-                segment.pop(0)
-
-    def center_world(self):
-        if self.mass < EPSILON or self.m_center is None:
-            return
-        self.last_shift_idx = (self.m_center * self.world.params['R']).astype(int)
-        self.world.cells = np.roll(self.world.cells, -self.last_shift_idx, (1, 0))
-        # self.world.cells = scipy.ndimage.shift(self.world.cells, -self.last_shift_idx, order=0, mode='wrap')
-        self.total_shift_idx += self.last_shift_idx
-
-
-class Recorder:
-    RECORD_ROOT = 'record'
-    FRAME_EXT = '.png'
-    VIDEO_EXT = '.mov'
-    GIF_EXT = '.gif'
-    ANIM_FPS = 25
-    ffmpeg_cmd = ['/usr/local/bin/ffmpeg',
-                  '-loglevel', 'warning', '-y',  # glocal options
-                  '-f', 'rawvideo', '-vcodec', 'rawvideo', '-pix_fmt', 'rgb24',  # input options
-                  '-s', '{}x{}'.format(SIZEX * PIXEL, SIZEY * PIXEL), '-r', str(ANIM_FPS),
-                  '-i', '{input}',  # input pipe
-                  # '-an', '-vcodec','h264', '-pix_fmt','yuv420p', '-crf','1',  # output options
-                  '-an', '-vcodec', 'copy',  # output options
-                  '{output}']  # ouput file
-
-    def __init__(self, world):
-        self.world = world
-        self.is_recording = False
-        self.is_save_frames = False
-        self.record_id = None
-        self.record_seq = None
-        self.img_dir = None
-        self.video_path = None
-        self.video = None
-        self.gif_path = None
-        self.gif = None
-
-    def toggle_recording(self, is_save_frames=False):
-        self.is_save_frames = is_save_frames
-        if not self.is_recording:
-            self.start_record()
-        else:
-            self.finish_record()
-
-    def start_record(self):
-        global STATUS
-        ''' https://trac.ffmpeg.org/wiki/Encode/H.264
-            https://trac.ffmpeg.org/wiki/Slideshow '''
-        self.is_recording = True
-        STATUS.append("> start " + ("saving frames" if self.is_save_frames else "recording video") + " and GIF...")
-        self.record_id = '{}-{}'.format(self.world.names[0].split('(')[0], datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
-        self.record_seq = 1
-        self.video_path = os.path.join(self.RECORD_ROOT, self.record_id + self.VIDEO_EXT)
-        self.gif_path = os.path.join(self.RECORD_ROOT, self.record_id + self.GIF_EXT)
-        self.img_dir = os.path.join(self.RECORD_ROOT, self.record_id)
-        if self.is_save_frames:
-            if not os.path.exists(self.img_dir):
-                os.makedirs(self.img_dir)
-        else:
-            cmd = [s.replace('{input}', '-').replace('{output}', self.video_path) for s in self.ffmpeg_cmd]
-            try:
-                self.video = subprocess.Popen(cmd, stdin=subprocess.PIPE)  # stderr=subprocess.PIPE
-            except FileNotFoundError:
-                self.video = None
-                STATUS.append("> no ffmpeg program found!")
-        self.gif = []
-
-    def save_image(self, img, filename=None):
-        self.record_id = '{}-{}'.format(self.world.names[0].split('(')[0], datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
-        img_path = filename + self.FRAME_EXT if filename else os.path.join(self.RECORD_ROOT, self.record_id + self.FRAME_EXT)
-        img.save(img_path)
-
-    def record_frame(self, img):
-        if self.is_save_frames:
-            img_path = os.path.join(self.RECORD_ROOT, self.record_id, '{:03d}'.format(self.record_seq) + self.FRAME_EXT)
-            img.save(img_path)
-        else:
-            if self.video:
-                img_rgb = img.convert('RGB').tobytes()
-                self.video.stdin.write(img_rgb)
-        self.gif.append(img)
-        self.record_seq += 1
-
-    def finish_record(self):
-        global STATUS
-        if self.is_save_frames:
-            STATUS.append("> frames saved to '" + self.img_dir + "/*" + self.FRAME_EXT + "'")
-            cmd = [s.replace('{input}', os.path.join(self.img_dir, '%03d' + self.FRAME_EXT)).replace('{output}', self.video_path) for s in self.ffmpeg_cmd]
-            try:
-                subprocess.call(cmd)
-            except FileNotFoundError:
-                self.video = None
-                STATUS.append("> no ffmpeg program found!")
-        else:
-            if self.video:
-                self.video.stdin.close()
-                STATUS.append("> video saved to '" + self.video_path + "'")
-        durations = [1000 // self.ANIM_FPS] * len(self.gif)
-        durations[-1] *= 10
-        self.gif[0].save(self.gif_path, format=self.GIF_EXT.lstrip('.'), save_all=True, append_images=self.gif[1:], loop=0, duration=durations)
-        self.gif = None
-        STATUS.append("> GIF saved to '" + self.gif_path + "'")
-        self.is_recording = False
-
+import copy, json, csv
+import io, time
+from src.params import *
 
 class Lenia:
     MARKER_COLORS_W = [0x5F, 0x5F, 0x5F, 0x7F, 0x7F, 0x7F, 0xFF, 0xFF, 0xFF]
@@ -631,6 +49,8 @@ class Lenia:
         self.search_dir = None
         self.is_search_small = False
         self.is_empty = False
+        self.value_s = SIGMA
+        self.value_m = MU
 
         ''' http://hslpicker.com/ '''
         self.colormaps = [
@@ -1512,26 +932,38 @@ class Lenia:
     def update_midi_controls(self, controls):
         CONTROLS = [13, 14, 15, 16, 17, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 36, 49, 50, 51, 52, 53, 54, 55, 56, 77, 78, 79, 80, 81, 82, 83, 84]
         RANGE_B = np.arange(0, 1.001, 1/127)
+        # print(controls)
         for control, value in controls.items():
-            if control == 13:
-                self.world.params['m'] = RANGE_MU[value]
-            elif control == 14:
-                self.world.params['s'] = RANGE_SIGMA[value]
-            elif control == 15:
+            if control == 16:
+                self.world.params['m'] += DIFF_MU[value]
+                self.value_m = value
+                print('Setting mean to: {}'.format(RANGE_MU[value]))
+            elif control == 17:
+                self.world.params['s'] += DIFF_SIGMA[value]#RANGE_SIGMA[value]
+                self.value_s = value
+                print('Setting std to: {}'.format(RANGE_SIGMA[value]))
+            elif control == 18:
                 self.world.params['T'] = RANGE_T[value]
-            elif control == 20:
+                print('Setting T to: {}'.format(RANGE_T[value]))
+            elif control == 19:
                 self.world.params['b'][0] = RANGE_B[value]
-            elif control == 36:
+                print('Setting beta 1 to: {}'.format(RANGE_B[value]))
+                print('Beta', self.world.params['b'])
+            elif control == 20:
                 while len(self.world.params['b']) < 2:
                     self.world.params['b'].append(0)
                 self.world.params['b'][1] = RANGE_B[value]
-            elif control == 56:
+                print('Setting beta 2 to: {}'.format(RANGE_B[value]))
+                print('Beta', self.world.params['b'])
+            elif control == 21:
                 while len(self.world.params['b']) < 3:
                     self.world.params['b'].append(0)
                 self.world.params['b'][2] = RANGE_B[value]
-        if 20 in controls.keys() or 36 in controls.keys() or 56 in controls.keys():
-            self.automaton.calc_once(is_update=False)
-            self.automaton.calc_kernel()
+                print('Setting beta 3 to: {}'.format(RANGE_B[value]))
+                print('Beta', self.world.params['b'])
+        # if 20 in controls.keys() or 36 in controls.keys() or 56 in controls.keys():
+        # self.automaton.calc_once(is_update=False)
+        # self.automaton.calc_kernel()
 
         self.analyzer.new_segment()
         self.check_auto_load()
@@ -1541,28 +973,28 @@ class Lenia:
             self.roundup(self.tx)
             self.automaton.calc_once(is_update=False)
 
-    def update_midi_notes(self, notes):
-        NOTES = [89, 90, 73, 41, 42, 43, 74, 75, 44, 76, 91, 92, 57, 58, 59, 60]
+    def update_midi_notes(self, control):
 
-        for note in notes:
-            print(note)
-            if note == 41:
-                # change kernel
-                self.automaton.kn = (self.automaton.kn + 1) % len(self.automaton.kernel_core) + 1
-                self.info_type = 'kn'
-                self.automaton.calc_once(is_update=False)
-                self.automaton.calc_kernel()
+        print(control)
+        if control == 32:
+            # change kernel
+            self.automaton.kn = (self.automaton.kn + 1) % len(self.automaton.kernel_core) + 1
+            self.info_type = 'kn'
+            self.automaton.calc_once(is_update=False)
+            self.automaton.calc_kernel()
 
-            elif note == 42:
-                # change growth function
-                self.automaton.gn = (self.automaton.gn + 1) % len(self.automaton.field_func) + 1
-                self.info_type = 'gn'
-                self.automaton.calc_once(is_update=False)
-                self.automaton.calc_kernel()
+        elif control == 33:
+            # change growth function
+            self.automaton.gn = (self.automaton.gn + 1) % len(self.automaton.field_func) + 1
+            self.info_type = 'gn'
+            self.automaton.calc_once(is_update=False)
+            self.automaton.calc_kernel()
 
-            elif note == 73:
-                # change animal to random
-                self.load_animal_id(np.random.randint(len(self.animal_data)))
+        elif control == 64:
+            # change animal to random
+            self.load_animal_id(np.random.randint(len(self.animal_data)))
+            DIFF_MU = np.arange(- DELTA_MU * self.value_m, DELTA_MU * (127 - self.value_m) + DELTA_MU / 2, DELTA_MU)
+            DIFF_SIGMA = np.arange(- DELTA_SIGMA * self.value_s, DELTA_SIGMA * (127 - self.value_s) + DELTA_SIGMA / 2, DELTA_SIGMA)
 
         self.analyzer.new_segment()
         self.check_auto_load()
@@ -1778,8 +1210,8 @@ class Lenia:
             if len(controls.keys()) > 0:
                 self.update_midi_controls(controls)
 
-            if len(notes) > 0:
-                self.update_midi_notes(notes)
+                if list(controls.keys())[0] in NOTES:
+                    self.update_midi_notes(list(controls.keys())[0])
 
             if self.is_empty:
                 self.load_animal_id(np.random.randint(len(self.animal_data)))

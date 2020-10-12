@@ -7,9 +7,61 @@ from fractions import Fraction
 class Board:
     def __init__(self, size=[0, 0]):
         self.names = ['', '', '']
-        self.params = {'R': DEF_R, 'T': 10, 'b': [1, 0, 0], 'm': 0.1, 's': 0.01, 'kn': 1, 'gn': 1}
+        self.keys = ['T', 'R', 'b', 'm', 's', 'kn', 'gn']
+        self.reset_kernels()
         self.param_P = 0
-        self.cells = np.zeros(size)
+        self.cells = np.zeros(size)  # states of cells
+
+    def reset_kernels(self):
+        self.params = dict()
+        for key in self.keys:
+            self.params[key] = dict()
+        self.params['T'] = 10
+        self._add_kernel(kernel_id=0,
+                         R=DEF_R,
+                         b=[1, 0, 0],
+                         m=0.1,
+                         s=0.01,
+                         kn=1,
+                         gn=1)
+        self.kernels_weights = [0.1]
+
+    @property
+    def nb_kernels(self):
+        return len(list(self.params['R'].keys()))
+
+    def add_kernel(self):
+        kernel_id = self.nb_kernels
+        if self.nb_kernels < 5:
+            self._add_kernel(kernel_id=kernel_id,
+                             R=DEF_R,
+                             b=[1, 0, 0],
+                             m=0.1,
+                             s=0.01,
+                             kn=1,
+                             gn=1,
+                             )
+            self.kernels_weights.append(1)
+            print('Adding one kernel, total: ', self.nb_kernels)
+        else:
+            print('Already {} kernels'.format(self.nb_kernels))
+    def remove_kernel(self):
+        kernel_id = self.nb_kernels - 1
+        if kernel_id > 1:
+            self._remove_kernel(kernel_id)
+            self.kernels_weights.pop()
+            print('Removing one kernel, total: ', self.nb_kernels)
+        else:
+            print('Only one remaining kernel.')
+
+    def _add_kernel(self, kernel_id, **kwargs):
+        for k in kwargs.keys():
+            self.params[k][kernel_id] = kwargs[k]
+
+    def _remove_kernel(self, kernel_id):
+        for k in self.keys:
+            if k != 'T':
+                del self.params[k][kernel_id]
 
     @classmethod
     def from_values(cls, cells, params=None, names=None):
@@ -32,6 +84,21 @@ class Board:
             if type(self.cells) in [tuple, list]:
                 self.cells = ''.join(self.cells)
             self.cells = Board.rle2arr(self.cells)
+        params = self.params
+        self.reset_kernels()
+
+        if params:
+            if 'T' in params.keys():
+                T = params['T']
+                del params['T']
+            else:
+                T = 10
+
+            self._add_kernel(kernel_id=0,
+                             **params)
+            self.params['T'] = T
+        else:
+            self.add_kernel()
         return self
 
     def to_data(self, is_shorten=True):
@@ -112,13 +179,13 @@ class Board:
                     self.cells[(j1 + y) % h1, (i1 + x) % w1] = part.cells[j2 + y, i2 + x]
         return self
 
-    def transform(self, tx, mode='RZSF', is_world=False):
+    def transform(self, tx, mode='RZSF', is_world=False, kernel_id=0):
         if 'R' in mode and tx['rotate'] != 0:
             self.cells = scipy.ndimage.rotate(self.cells, tx['rotate'], reshape=not is_world, order=0, mode='wrap' if is_world else 'constant')
         if 'Z' in mode and tx['R'] != self.params['R']:
             # print('* {} / {}'.format(tx['R'], self.params['R']))
             shape_orig = self.cells.shape
-            self.cells = scipy.ndimage.zoom(self.cells, tx['R'] / self.params['R'], order=0)
+            self.cells = scipy.ndimage.zoom(self.cells, tx['R'][kernel_id] / self.params['R'][kernel_id], order=0)
             if is_world:
                 self.cells = Board(shape_orig).add(self).cells
             self.params['R'] = tx['R']
@@ -136,9 +203,9 @@ class Board:
         # self.cells = np.roll(self.cells, tx['shift'], (1, 0))
         return self
 
-    def add_transformed(self, part, tx):
+    def add_transformed(self, part, tx, kernel_id=0):
         part = copy.deepcopy(part)
-        self.add(part.transform(tx, mode='RZF'), tx['shift'])
+        self.add(part.transform(tx, mode='RZF', kernel_id=kernel_id), tx['shift'])
         return self
 
     def crop(self):

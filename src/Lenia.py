@@ -6,7 +6,6 @@ from src.board import Board
 from src.automaton import Automaton
 from src.analyzer import Analyzer
 from src.recorder import Recorder
-
 try:
     import tkinter as tk
 except:
@@ -15,6 +14,13 @@ from fractions import Fraction
 import copy, json, csv
 import io, time
 from src.params import *
+from audio import *
+from src.tools.setup_mic import MicStream
+import matplotlib
+HERE_PATH = os.getcwd() +'/'
+CLASSIF_PATH = os.getcwd() + "/data/classif/"
+
+AUDIO_CONTROL = True
 
 class Lenia:
     MARKER_COLORS_W = [0x5F, 0x5F, 0x5F, 0x7F, 0x7F, 0x7F, 0xFF, 0xFF, 0xFF]
@@ -49,11 +55,25 @@ class Lenia:
         self.search_dir = None
         self.is_search_small = False
         self.is_empty = False
-        self.value_s = SIGMA
-        self.value_m = MU
 
         ''' http://hslpicker.com/ '''
-        self.colormaps = [
+        cmaps = [matplotlib.cm.get_cmap('cool'),
+                 matplotlib.cm.get_cmap('PiYG'),
+                 matplotlib.cm.get_cmap('hsv'),
+                 matplotlib.cm.get_cmap('gnuplot2'),
+                 matplotlib.cm.get_cmap('turbo'),
+                 matplotlib.cm.get_cmap('rainbow'),
+                 matplotlib.cm.get_cmap('RdPu'),
+                 matplotlib.cm.get_cmap('magma'),
+                 matplotlib.cm.get_cmap('inferno'),
+                 matplotlib.cm.get_cmap('Spectral')
+                 ]
+
+        self.colormaps = []
+        for c in cmaps:
+            self.colormaps.append(self.create_colormap(np.array([c(i) for i in np.arange(0, 1, 1/256)])[:, :3] * 8))
+        self.colormaps += [
+            self.create_colormap(np.array([[0, 188, 212], [178, 235, 242], [255, 87, 34], [221, 44, 0]]) / 255 * 8),
             self.create_colormap(np.array([[0, 0, 4], [0, 0, 8], [0, 4, 8], [0, 8, 8], [4, 8, 4], [8, 8, 0], [8, 4, 0], [8, 0, 0], [4, 0, 0]])),  # BCYR
             self.create_colormap(np.array([[0, 2, 0], [0, 4, 0], [4, 6, 0], [8, 8, 0], [8, 4, 4], [8, 0, 8], [4, 0, 8], [0, 0, 8], [0, 0, 4]])),  # GYPB
             self.create_colormap(np.array([[4, 0, 2], [8, 0, 4], [8, 0, 6], [8, 0, 8], [4, 4, 4], [0, 8, 0], [0, 6, 0], [0, 4, 0], [0, 2, 0]])),  # PPGG
@@ -78,25 +98,258 @@ class Lenia:
 
         self.read_animals()
         self.world = Board((SIZEY, SIZEX))
+
+        self.knob_inits = dict(zip(knobs_keys, [64] * len(knobs_keys)))
+        self.current_angle = 0
+        self.reset_controls()
+
         # self.target = Board((SIZEY, SIZEX))
         self.automaton = Automaton(self.world)
         self.analyzer = Analyzer(self.automaton)
         self.recorder = Recorder(self.world)
         self.clear_transform()
         self.create_window()
+        # self.signals = SIGNALS
+        if AUDIO_CONTROL:
+            self.mic_stream = MicStream()
+        self.real_time = 0
+        self.time_since_save = 0
+        self.img_count = 0
+        self.audio_bin_count = 0
 
+    def get_controls(self, knob_value, value, end_min, end_max, big=True):
+        if value > end_max or value < end_min:
+            print('RANGE', end_min, value, end_max)
+        end_max = max(end_max, value)
+        end_min = min(end_min, value)
+        assert knob_value >= 0 and knob_value < 128
+        if not big:
+            end_max = value + (end_max - value) / 2
+            end_min = value - (value - end_min) / 2
+        if knob_value == 0:
+            low_range = np.array([value])
+        else:
+            low_delta = (value - end_min) / knob_value
+            if low_delta < 1e-5:
+                low_range = np.zeros([knob_value + 1])
+            else:
+                low_range = np.arange(end_min, value + low_delta / 2, low_delta)
+        if knob_value == 127:
+            high_range = np.array([value])
+        else:
+            high_delta = (end_max - value) / (127 - knob_value)
+            if high_delta < 1e-5:
+                high_range = np.zeros([127 - knob_value])
+            else:
+                high_range = np.arange(value, end_max, high_delta)
+        out =  np.concatenate([low_range, high_range], axis=0)
+        return out[:128]
+
+    def reset_controls(self):
+        self.kernel_id = 0
+        self.small_controls = dict()
+        self.big_controls = dict()
+        self.initial_world_params = copy.deepcopy(self.world.params)
+        for k in knobs_keys:
+            # print(k)
+            end_min, end_max = RANGES[k]
+            if k == 'T':
+                current_value = self.world.params['T']
+            elif k == 'R':
+                current_value = self.world.params['R'][0]
+            elif k == 'k_mu':
+                current_value = self.world.params['m'][0]
+            elif k == 'k_s':
+                current_value = self.world.params['s'][0]
+            elif 'beta' in k:
+                i = int(k.split('_')[1])
+                if len(self.world.params['b'][0]) > i:
+                    current_value = self.world.params['b'][0][i]
+                else:
+                    current_value = 0
+            elif k == 'angle':
+                current_value = 0
+            # current_value = self.world.params[k] if k == 'T' else self.world.params[k][0]
+            self.small_controls[k] = self.get_controls(knob_value=self.knob_inits[k],
+                                                       value=current_value,
+                                                       end_min=end_min,
+                                                       end_max=end_max,
+                                                       big=False)
+            self.big_controls[k] = self.get_controls(knob_value=self.knob_inits[k],
+                                                     value=current_value,
+                                                     end_min=end_min,
+                                                     end_max=end_max,
+                                                     big=True)
+            assert self.small_controls[k][self.knob_inits[k]] - current_value < 1e-8
+            assert self.big_controls[k][self.knob_inits[k]] - current_value < 1e-8
+            assert self.small_controls[k].size == 128
+            assert self.big_controls[k].size == 128
+
+
+# delta = KNOBS_DELTAS[k]
+# self.big_controls[k] = np.arange(- delta * self.knob_inits[k], delta * (127 - self.knob_inits[k]) + delta / 2, delta)
+# delta /= 10
+            # self.small_controls[k] = np.arange(- delta * self.knob_inits[k], delta * (127 - self.knob_inits[k]) + delta / 2, delta)
+            # assert self.big_controls[k][self.knob_inits[k]] < 1e-10
+            # assert self.small_controls[k][self.knob_inits[k]] < 1e-10
+        self.controls = self.small_controls
+        self.small = True
+
+
+    def update_midi_controls(self, controls):
+        for control, value in controls.items():
+            # print(controls)
+            if control in KNOBS_REFS_TO_KEYS.keys():
+                key = KNOBS_REFS_TO_KEYS[control]
+                self.knob_inits[key] = value
+                if key == 'k_mu':
+                    self.world.params['m'][self.kernel_id] = self.controls[key][value]#self.initial_world_params['m'][self.kernel_id] + self.controls[key][value]
+                    print('K{}, Setting mean to: {}'.format(self.kernel_id, self.world.params['m'][self.kernel_id]))
+                elif key == 'k_s':
+                    self.world.params['s'][self.kernel_id] = self.controls[key][value]#self.initial_world_params['s'][self.kernel_id] + self.controls[key][value]
+                    print('K{}, Setting std to: {}'.format(self.kernel_id,self.world.params['s'][self.kernel_id]))
+                elif key == 'T':
+                    self.world.params['T'] = self.controls[key][value]#max(self.initial_world_params['T'] + self.controls[key][value], 1)
+                    print('Setting T to: {}'.format(self.world.params['T'] ))
+                elif key == 'beta_1':
+                    self.world.params['b'][self.kernel_id][0] = self.controls[key][value]# max(self.initial_world_params['b'][self.kernel_id][0] + self.controls[key][value], 0)
+                    print('K{}, Setting beta 1 to: {}'.format(self.kernel_id, self.world.params['b'][self.kernel_id][0]))
+                    print('K{}, Beta', self.world.params['b'][self.kernel_id])
+                elif key == 'beta_2':
+                    while len(self.world.params['b'][self.kernel_id]) < 2:
+                        self.world.params['b'][self.kernel_id].append(0)
+                    while len(self.initial_world_params['b'][self.kernel_id]) < 4:
+                        self.initial_world_params['b'][self.kernel_id].append(0)
+                    self.world.params['b'][self.kernel_id][1] = self.controls[key][value]#max(self.initial_world_params['b'][self.kernel_id][1] + self.controls[key][value], 0)
+                    print('K{}, Setting beta 2 to: {}'.format(self.kernel_id, self.world.params['b'][self.kernel_id][1]))
+                    print('K{}, Beta'.format(self.kernel_id), self.world.params['b'][self.kernel_id])
+                elif key == 'beta_3':
+                    while len(self.world.params['b'][self.kernel_id]) < 3:
+                        self.world.params['b'][self.kernel_id].append(0)
+                    while len(self.initial_world_params['b'][self.kernel_id]) < 4:
+                        self.initial_world_params['b'][self.kernel_id].append(0)
+                    self.world.params['b'][self.kernel_id][2] = self.controls[key][value]# max(self.initial_world_params['b'][self.kernel_id][2] + self.controls[key][value], 0)
+                    print('K{}, Setting beta 3 to: {}'.format(self.kernel_id, self.world.params['b'][self.kernel_id][2]))
+                    print('K{}, Beta'.format(self.kernel_id), self.world.params['b'][self.kernel_id])
+                elif key == 'beta_4':
+                    while len(self.world.params['b'][self.kernel_id]) < 4:
+                        self.world.params['b'][self.kernel_id].append(0)
+                    while len(self.initial_world_params['b'][self.kernel_id]) < 4:
+                        self.initial_world_params['b'][self.kernel_id].append(0)
+                    self.world.params['b'][self.kernel_id][3] = self.controls[key][value]#max(self.initial_world_params['b'][self.kernel_id][3] + self.controls[key][value], 0)
+                    print('K{}, Setting beta 3 to: {}'.format(self.kernel_id, self.world.params['b'][self.kernel_id][3]))
+                    print('K{}, Beta'.format(self.kernel_id), self.world.params['b'][self.kernel_id])
+                elif key == 'R':
+                    # self.world.params['R'][self.kernel_id] = int(max(self.initial_world_params['R'][self.kernel_id] + self.controls[key][value], 5))
+                    print("K{}, R = ".format(self.kernel_id), self.world.params['R'][self.kernel_id])
+                    self.tx['R'][0] = self.controls[key][value]#int(max(self.initial_world_params['R'][self.kernel_id] + self.controls[key][value], 5))
+                    # self.tx['R'][0] /= 2
+                    self.transform_world()
+                elif key == 'angle':
+                    delta_angle = self.controls[key][value] - self.current_angle
+                    self.tx['rotate'] = delta_angle
+                    self.transform_world()
+                    self.current_angle = self.controls[key][value]
+
+
+            elif control in BUTTONS_REFS_TO_KEYS.keys() and value == 127:
+                key = BUTTONS_REFS_TO_KEYS[control]
+                if key == 'random_world':
+                    self.random_world()
+                elif key == 'random_animal':
+                    # change animal to random
+                    done = False
+                    while not done:
+                        self.load_animal_id(np.random.randint(len(self.animal_data)))
+                        if self.world.params['kn'][0] == 1:
+                            done = True
+                elif key == 'colormap':
+                    self.colormap_id = (self.colormap_id + 1) % len(self.colormaps)
+                    print('Switching to colormap #{}'.format(self.colormap_id + 1))
+                elif key == 'random_patch':
+                    self.add_random_patch()
+                elif key == 'flip1':
+                    self.tx['flip'] = 1 if self.tx['flip'] != 0 else -1;
+                    self.transform_world()
+                elif key == 'flip2':
+                    self.tx['flip'] = 2 if self.tx['flip'] != 0 else -1;
+                    self.transform_world()
+                elif key == 'flip3':
+                    self.tx['flip'] = 3 if self.tx['flip'] != 0 else -1;
+                    self.transform_world()
+                elif key == 'flip4':
+                    self.tx['flip'] = 4 if self.tx['flip'] != 0 else -1;
+                    self.transform_world()
+                elif key == 'k_left':
+                    self.kernel_id = (self.kernel_id + 1) % self.world.nb_kernels
+                    print('Controlling kernel #{}'.format(self.kernel_id + 1))
+                elif key == 'k_right':
+                    self.kernel_id = (self.kernel_id - 1) % self.world.nb_kernels
+                    print('Controlling kernel #{}'.format(self.kernel_id + 1))
+                elif key == 'k_more':
+                    self.world.add_kernel()
+                    for k in self.world.keys:
+                        if k != 'T':
+                            self.initial_world_params[k][self.world.nb_kernels - 1] = self.world.params[k][self.world.nb_kernels - 1]
+                elif key == 'k_less':
+                    self.world.remove_kernel()
+                elif key == 'save_pos':
+                    cells = self.world.cells
+                    files = os.listdir(CLASSIF_PATH + 'pos/')
+                    fs = [int(f.split('_')[-1].split('.')[0]) for f in files]
+                    if len(fs) > 0:
+                        ind = np.max(fs)
+                    else:
+                        ind = 0
+                    np.savetxt(CLASSIF_PATH + 'pos/im_{}.txt'.format(ind + 1), cells)
+                    self.img.save(CLASSIF_PATH + 'pos/im_{}.png'.format(ind + 1))
+                    print('Added one pos example (#{})'.format(ind))
+                elif key == 'save_neg':
+                    cells = self.world.cells
+                    files = os.listdir(CLASSIF_PATH + 'neg/')
+                    fs = [int(f.split('_')[-1].split('.')[0]) for f in files]
+                    if len(fs) > 0:
+                        ind = np.max(fs)
+                    else:
+                        ind = 0
+                    np.savetxt(CLASSIF_PATH + 'neg/im_{}.txt'.format(ind + 1), cells)
+                    self.img.save(CLASSIF_PATH + 'neg/im_{}.png'.format(ind + 1))
+                    print('Added one neg example (#{})'.format(ind))
+                elif key == 'small/big':
+                    if self.small is True:
+                        self.small = False
+                        self.controls = self.big_controls
+                        msg = 'big'
+                    else:
+                        self.small = True
+                        self.controls = self.small_controls
+                        msg = 'small'
+                    print('Now using {} controls'.format(msg))
+        # if 20 in controls.keys() or 36 in controls.keys() or 56 in controls.keys():
+        self.automaton.calc_once(is_update=False)
+        self.automaton.calc_kernel()
+
+        self.analyzer.new_segment()
+        self.check_auto_load()
+
+        if self.is_loop:
+            self.roundup(self.world.params)
+            self.roundup(self.tx)
+            self.automaton.calc_once(is_update=False)
     # self.create_menu()
 
     def clear_transform(self):
         self.tx = {'shift': [0, 0], 'rotate': 0, 'R': self.world.params['R'], 'flip': -1}
 
     def read_animals(self):
-        with open('animals.json', encoding='utf-8') as file:
+        with open(HERE_PATH + 'animals.json', encoding='utf-8') as file:
             self.animal_data = json.load(file)
 
     def load_animal_id(self, id, **kwargs):
+        self.world.reset_kernels()
         self.animal_id = max(0, min(len(self.animal_data) - 1, id))
         self.load_part(Board.from_data(self.animal_data[self.animal_id]), **kwargs)
+        self.reset_controls()
 
     def load_animal_code(self, code, **kwargs):
         if not code: return
@@ -150,7 +403,7 @@ class Lenia:
                     h, w = min(part.cells.shape, self.world.cells.shape)
                     self.tx['shift'] = [np.random.randint(d1 + d) - d1 // 2 for (d, d1) in [(h, h1), (w, w1)]]
                     self.tx['flip'] = np.random.randint(3) - 1
-                self.world.add_transformed(part, self.tx)
+                self.world.add_transformed(part, self.tx, kernel_id=0)
 
     def check_auto_load(self):
         if self.is_auto_load:
@@ -186,10 +439,22 @@ class Lenia:
         self.world_updated()
 
     def random_world(self):
-        border = self.world.params['R']
+        border = int(self.world.params['R'][0])
         rand = np.random.rand(SIZEY - border * 2, SIZEX - border * 2)
         self.world.clear()
         self.world.add(Board.from_values(rand))
+        self.world_updated()
+
+    def add_random_patch(self):
+        size = np.random.randint(0, SIZEX // 3, size=2)
+        position = np.random.randint([0, 0], [SIZEX, SIZEY])
+        board = np.zeros([SIZEX, SIZEY])
+        size_x = min(SIZEX, position[0] + size[0]) - position[0]
+        size_y = min(SIZEY, position[1] + size[1]) - position[1]
+        rand = np.random.rand(size_x, size_y)
+        board[position[0]:min(SIZEX, position[0] + size[0]),
+        position[1]:min(SIZEY, position[1] + size[1])] = rand
+        self.world.add(Board.from_values(board))
         self.world_updated()
 
     def toggle_trace(self, small):
@@ -427,155 +692,6 @@ class Lenia:
         #    self.draw_histo(A, vmin, vmax)
         self.img.putpalette(self.colormaps[self.colormap_id])
 
-    # def draw_histo(self, A, vmin, vmax):
-    # draw = PIL.ImageDraw.Draw(self.img)
-    # HWIDTH = 1
-    # hist, _ = np.histogram(A, bins=SIZEX//HWIDTH, range=(vmin,vmax))  #, density=True)
-    # #print(vmin, vmax, A.min(), A.max())
-    # for i in range(hist.shape[0]):
-    # h = hist[i]
-    # y = h  #(h*SIZEY).astype(int)
-    # draw.rectangle([(i*HWIDTH*PIXEL,SIZEY*PIXEL),((i+1)*HWIDTH*PIXEL-1,(SIZEY-y)*PIXEL)], fill=254)
-    # del draw
-
-    # def draw_black(self):
-    # 	size = (SIZEX*PIXEL,SIZEY*PIXEL)
-    # 	self.img = PIL.Image.frombuffer('L', size, np.zeros(size), 'raw', 'L', 0, 1)
-
-    # def draw_grid(self, buffer, markers=[], is_fixed=False):
-    # 	R = self.world.params['R']
-    # 	n = R // 40 if R >= 15 else -1
-    # 	if ('grid' in markers or 'fixgrid' in markers) and self.markers_mode in [0,1,2]:
-    # 		for i in range(-n, n+1):
-    # 			sx, sy = 0, 0
-    # 			if self.is_auto_center and not is_fixed:
-    # 				sx, sy = self.analyzer.total_shift_idx.astype(int)
-    # 			grid = buffer[(MIDY - sy + i) % R:SIZEY:R, (MIDX - sx) % R:SIZEX:R];  grid[grid==0] = 253
-    # 			grid = buffer[(MIDY - sy) % R:SIZEY:R, (MIDX - sx + i) % R:SIZEX:R];  grid[grid==0] = 253
-
-    # def draw_arrow(self, markers=[]):
-    # 	draw = PIL.ImageDraw.Draw(self.img)
-    # 	R, T = [self.world.params[k] for k in ('R', 'T')]
-    # 	midpoint = np.array([MIDX, MIDY])
-    # 	d2 = np.array([1, 1]) * 2
-    # 	if 'arrow' in markers and self.markers_mode in [0,1,2] and self.world.params['R'] > 2 and self.analyzer.m_last_center is not None and self.analyzer.m_center is not None:
-    # 		shift = self.analyzer.total_shift_idx if not self.is_auto_center else np.zeros(2)
-    # 		m0 = self.analyzer.m_last_center * R + midpoint + shift - self.analyzer.last_shift_idx
-    # 		m1 = self.analyzer.m_center * R + midpoint + shift
-    # 		ms = m1 % np.array([SIZEX, SIZEY]) - m1
-    # 		m2, m3 = [m0 + (m1 - m0) * n * T for n in [1,2]]
-    # 		for i in range(-1, 2):
-    # 			for j in range(-1, 2):
-    # 				adj = np.array([i*SIZEX, j*SIZEY]) + ms
-    # 				draw.line(tuple((m0+adj)*PIXEL) + tuple((m3+adj)*PIXEL), fill=254, width=1)
-    # 				[draw.ellipse(tuple((m+adj)*PIXEL-d2) + tuple((m+adj)*PIXEL+d2), fill=c) for (m,c) in [(m0,254),(m1,255),(m2,255),(m3,255)]]
-    # 	del draw
-
-    # def draw_legend(self, markers=[]):
-    # 	draw = PIL.ImageDraw.Draw(self.img)
-    # 	R, T = [self.world.params[k] for k in ('R', 'T')]
-    # 	midpoint = np.array([MIDX, MIDY])
-    # 	d2 = np.array([1, 1]) * 2
-    # 	if 'arrow' in markers and self.markers_mode in [0,1,3,4]:
-    # 		x0, y0 = SIZEX*PIXEL-50, SIZEY*PIXEL-35
-    # 		draw.line([(x0-90,y0),(x0,y0)], fill=254, width=1)
-    # 		[draw.ellipse(tuple((x0+m,y0)-d2) + tuple((x0+m,y0)+d2), fill=c) for (m,c) in [(0,254),(-10,255),(-50,255),(-90,255)]]
-    # 		draw.text((x0-95,y0-20), '2s', fill=255)
-    # 		draw.text((x0-55,y0-20), '1s', fill=255)
-    # 		if self.is_auto_center and self.is_auto_rotate:
-    # 			for i in range(self.ang_sides):
-    # 				angle = 2*np.pi * i / self.ang_sides
-    # 				d = np.array([np.sin(angle), np.cos(angle)])*SIZEX
-    # 				draw.line(tuple(midpoint*PIXEL) + tuple((midpoint-d)*PIXEL), fill=254, width=1)
-    # 	if 'scale' in markers and self.markers_mode in [0,1,3,4]:
-    # 		x0, y0 = SIZEX*PIXEL-50, SIZEY*PIXEL-20
-    # 		draw.text((x0+10,y0), '1mm', fill=255)
-    # 		draw.rectangle([(x0-R*PIXEL,y0+3),(x0,y0+7)], fill=255)
-    # 	if 'colormap' in markers and self.markers_mode in [0,3]:
-    # 		x0, y0 = SIZEX*PIXEL-20, SIZEY*PIXEL-70
-    # 		x1, y1 = SIZEX*PIXEL-15, 20
-    # 		dy = (y1-y0)/253
-    # 		draw.rectangle([(x0-1,y0+1),(x1+1,y1-1)], outline=254)
-    # 		for c in range(253):
-    # 			draw.rectangle([(x0,y0+dy*c),(x1,y0+dy*(c+1))], fill=c)
-    # 		draw.text((x0-25,y0-5), '0.0', fill=255)
-    # 		draw.text((x0-25,(y1+y0)//2-5), '0.5', fill=255)
-    # 		draw.text((x0-25,y1-5), '1.0', fill=255)
-    # 	del draw
-    #
-    # def draw_stats(self):
-    # 	draw = PIL.ImageDraw.Draw(self.img)
-    # 	series = self.analyzer.series
-    # 	name_x = self.analyzer.STAT_HEADERS[self.stats_x]
-    # 	name_y = self.analyzer.STAT_HEADERS[self.stats_y]
-    # 	if series != [] and self.stats_mode in [1, 2, 3]:
-    # 		series = [series[-1]]
-    # 	if series != [] and series != [[]]:
-    # 		X = [np.array([val[self.stats_x] for val in seg]) for seg in series if len(seg)>0]
-    # 		Y = [np.array([val[self.stats_y] for val in seg]) for seg in series if len(seg)>0]
-    # 		S = [seg[0][1] for seg in series if len(seg)>0]
-    # 		M = [seg[0][0] for seg in series if len(seg)>0]
-    # 		if name_x in ['n', 't']: X = [seg - seg.min() for seg in X]
-    # 		if name_y in ['n', 't']: Y = [seg - seg.min() for seg in Y]
-    # 		xmin, xmax = min(seg.min() for seg in X if seg.size>0), max(seg.max() for seg in X if seg.size>0)
-    # 		ymin, ymax = min(seg.min() for seg in Y if seg.size>0), max(seg.max() for seg in Y if seg.size>0)
-    # 		smin, smax = min(S), max(S)
-    # 		mmin, mmax = min(M), max(M)
-    # 		# xmean, ymean = (xmax+xmin) / 2, (ymax+ymin) / 2
-    # 		# if xmax-xmin < 0.01: xmin, xmax = xmean-0.01, xmean+0.01
-    # 		# if ymax-ymin < 0.01: ymin, ymax = ymean-0.01, ymean+0.01
-    # 		# if name_x in ['m_a']:
-    # 			# mass = [np.array([val[4] for val in seg]) for seg in series if len(seg)>0]
-    # 			# massmax = max(seg.max() for seg in mass if seg.size>0)
-    # 			# if name_x in ['m_a']:
-    # 				# xmin, xmax = min(xmin, -massmax/32), max(xmax, massmax/32)
-    # 		if self.stats_mode in [1]:
-    # 			xmax = (xmax - xmin) * 4 + xmin
-    # 			ymax = (ymax - ymin) * 4 + ymin
-    # 			title_x, title_y = 1, SIZEY * 3 // 4 - 4
-    # 		else:
-    # 			title_x, title_y = 1, 1
-    # 		# font = PIL.ImageFont.truetype('InputMono-Regular.ttf')
-    # 		draw.text((title_x*PIXEL,title_y*PIXEL), (name_x+'-'+name_y), fill=255)
-    # 		if self.stats_mode in [4]:
-    # 			C = reversed([194 // 2**i + 61 for i in range(len(X))])
-    # 		else:
-    # 			C = [255] * len(X)
-    # 		ds = 0.0001 if self.is_search_small else 0.001
-    # 		dm = 0.001 if self.is_search_small else 0.01
-    # 		for x, y, m, s, c in zip(X, Y, M, S, C):
-    # 			is_valid = not np.isnan(x[0])
-    # 			if self.is_group_params:
-    # 				xmin, xmax = x.min(), x.max()
-    # 				ymin, ymax = y.min(), y.max()
-    # 				x, y = self.normalize(x, xmin, xmax), self.normalize(y, ymin, ymax)
-    # 				s, m = self.normalize(s, smin, smax+ds), self.normalize(m, mmin, mmax+dm)
-    # 				x, x0, x1 = [(a * ds/(smax-smin+ds) + s) * (SIZEX*PIXEL - 10) + 5 for a in [x, 0, 1]]
-    # 				y, y0, y1 = [(1 - a * dm/(mmax-mmin+dm) - m) * (SIZEY*PIXEL - 10) + 5 for a in [y, 0, 1]]
-    # 				draw.rectangle([(x0,y0),(x1,y1)], outline=c, fill=None if is_valid else c)
-    # 			else:
-    # 				x = self.normalize(x, xmin, xmax) * (SIZEX*PIXEL - 10) + 5
-    # 				y = (1-self.normalize(y, ymin, ymax)) * (SIZEY*PIXEL - 10) + 5
-    # 			if is_valid:
-    # 				draw.line(list(zip(x, y)), fill=c, width=1)
-    # 	del draw
-    #
-    # def draw_recurrence(self, e=0.1, steps=10):
-    # 	''' https://stackoverflow.com/questions/33650371/recurrence-plot-in-python '''
-    # 	if self.analyzer.series == [] or len(self.analyzer.series[-1]) < 2:
-    # 		return
-    #
-    # 	size = min(SIZEX*PIXEL, SIZEY*PIXEL)
-    # 	segment = np.array(self.analyzer.series[-1])[-size:, 4:]
-    # 	vmin, vmax = segment.min(axis=0), segment.max(axis=0)
-    # 	# vmean = (vmax + vmin) / 2
-    # 	# d = vmax - vmin < 0.01
-    # 	# vmin[d], vmax[d] = vmean[d] - 0.01, vmean[d] + 0.01
-    # 	segment = self.normalize(segment, vmin, vmax)
-    # 	D = scipy.spatial.distance.squareform(np.log(scipy.spatial.distance.pdist(segment))) + np.eye(segment.shape[0]) * -100
-    # 	buffer = np.uint8(np.clip(-D/2, 0, 1) * 253)
-    # 	self.img = PIL.Image.frombuffer('L', buffer.shape, buffer, 'raw', 'L', 0, 1)
-
     def calc_fps(self):
         freq = 20 if self.show_freq == 1 else 200
         if self.automaton.gen == 0:
@@ -634,13 +750,6 @@ class Lenia:
     def key_press_internal(self, key):
         self.last_key = key
         self.is_internal_key = True
-
-    def change_b(self, i, d):
-        B = len(self.world.params['b'])
-        if B > 1 and i < B:
-            self.world.params['b'][i] = min(1, max(0, self.world.params['b'][i] + Fraction(d, 12)))
-            self.automaton.calc_kernel()
-            self.check_auto_load()
 
     ANIMAL_KEY_LIST = {'1': 'O2(a)', '2': 'OG2', '3': 'OV2', '4': 'P4(a)', '5': '2S1:5', '6': '2S2:2', '7': '2P6,2,1', '8': '2PG1:2', '9': '3H3', '0': '~gldr', \
                        's+1': '3G2:4', 's+2': '3GG2', 's+3': 'K5(4,1)', 's+4': 'K7(4,3)', 's+5': 'K9(5,4)', 's+6': '3R5', 's+7': '4R6', 's+8': '2D10', 's+9': '4F12',
@@ -710,7 +819,7 @@ class Lenia:
         elif k in ['g', 's+g']:
             self.world.params['T'] = max(1, self.world.params['T'] // double_or_not - inc_or_not); self.info_type = 'params'
         elif k in ['r', 's+r']:
-            self.tx['R'] = max(1, self.tx['R'] + inc_10_or_1); self.transform_world(); self.info_type = 'params'
+            self.tx['R'][0] = max(1, self.tx['R'][0] + inc_10_or_1); self.transform_world(); self.info_type = 'params'
         elif k in ['f', 's+f']:
             self.tx['R'] = max(1, self.tx['R'] - inc_10_or_1); self.transform_world(); self.info_type = 'params'
         elif k in ['e', 's+e']:
@@ -928,83 +1037,6 @@ class Lenia:
         state = 'normal' if key or animal_id else tk.DISABLED
         return {'accelerator': acc, 'command': func, 'state': state}
 
-
-    def update_midi_controls(self, controls):
-        CONTROLS = [13, 14, 15, 16, 17, 18, 19, 20, 29, 30, 31, 32, 33, 34, 35, 36, 49, 50, 51, 52, 53, 54, 55, 56, 77, 78, 79, 80, 81, 82, 83, 84]
-        RANGE_B = np.arange(0, 1.001, 1/127)
-        # print(controls)
-        for control, value in controls.items():
-            if control == 16:
-                self.world.params['m'] += DIFF_MU[value]
-                self.value_m = value
-                print('Setting mean to: {}'.format(RANGE_MU[value]))
-            elif control == 17:
-                self.world.params['s'] += DIFF_SIGMA[value]#RANGE_SIGMA[value]
-                self.value_s = value
-                print('Setting std to: {}'.format(RANGE_SIGMA[value]))
-            elif control == 18:
-                self.world.params['T'] = RANGE_T[value]
-                print('Setting T to: {}'.format(RANGE_T[value]))
-            elif control == 19:
-                self.world.params['b'][0] = RANGE_B[value]
-                print('Setting beta 1 to: {}'.format(RANGE_B[value]))
-                print('Beta', self.world.params['b'])
-            elif control == 20:
-                while len(self.world.params['b']) < 2:
-                    self.world.params['b'].append(0)
-                self.world.params['b'][1] = RANGE_B[value]
-                print('Setting beta 2 to: {}'.format(RANGE_B[value]))
-                print('Beta', self.world.params['b'])
-            elif control == 21:
-                while len(self.world.params['b']) < 3:
-                    self.world.params['b'].append(0)
-                self.world.params['b'][2] = RANGE_B[value]
-                print('Setting beta 3 to: {}'.format(RANGE_B[value]))
-                print('Beta', self.world.params['b'])
-        # if 20 in controls.keys() or 36 in controls.keys() or 56 in controls.keys():
-        # self.automaton.calc_once(is_update=False)
-        # self.automaton.calc_kernel()
-
-        self.analyzer.new_segment()
-        self.check_auto_load()
-
-        if self.is_loop:
-            self.roundup(self.world.params)
-            self.roundup(self.tx)
-            self.automaton.calc_once(is_update=False)
-
-    def update_midi_notes(self, control):
-
-        print(control)
-        if control == 32:
-            # change kernel
-            self.automaton.kn = (self.automaton.kn + 1) % len(self.automaton.kernel_core) + 1
-            self.info_type = 'kn'
-            self.automaton.calc_once(is_update=False)
-            self.automaton.calc_kernel()
-
-        elif control == 33:
-            # change growth function
-            self.automaton.gn = (self.automaton.gn + 1) % len(self.automaton.field_func) + 1
-            self.info_type = 'gn'
-            self.automaton.calc_once(is_update=False)
-            self.automaton.calc_kernel()
-
-        elif control == 64:
-            # change animal to random
-            self.load_animal_id(np.random.randint(len(self.animal_data)))
-            DIFF_MU = np.arange(- DELTA_MU * self.value_m, DELTA_MU * (127 - self.value_m) + DELTA_MU / 2, DELTA_MU)
-            DIFF_SIGMA = np.arange(- DELTA_SIGMA * self.value_s, DELTA_SIGMA * (127 - self.value_s) + DELTA_SIGMA / 2, DELTA_SIGMA)
-
-        self.analyzer.new_segment()
-        self.check_auto_load()
-
-        if self.is_loop:
-            self.roundup(self.world.params)
-            self.roundup(self.tx)
-            self.automaton.calc_once(is_update=False)
-
-
     def get_animal_nested_list(self):
         root = []
         stack = [root]
@@ -1031,109 +1063,8 @@ class Lenia:
             obj = getattr(obj, n)
         return obj
 
-    def get_value_text(self, name):
-        if name == 'animal':
-            return '#' + str(self.animal_id + 1) + ' ' + self.world.long_name()
-        elif name == 'kn':
-            return ["Exponential", "Polynomial", "Step", "Staircase"][(self.world.params.get('kn') or self.automaton.kn) - 1]
-        elif name == 'gn':
-            return ["Exponential", "Polynomial", "Step"][(self.world.params.get('gn') or self.automaton.gn) - 1]
-        elif name == 'colormap_id':
-            return ["Vivid blue/red", "Vivid green/purple", "Vivid red/green", "Pale blue/red", "Pale green/purple", "Pale yellow/green", "White/black", "Black/white"][
-                self.colormap_id]
-        elif name == 'show_what':
-            return ["World", "Potential", "Field", "Kernel", "World FFT", "Potential FFT", "Gradient", "Change"][self.show_what]
-        elif name == 'markers_mode':
-            return ["Marks,legend,colors", "Marks,legend", "Marks", "Legend,colors", "Legend", "None"][self.markers_mode]
-        elif name == 'stats_mode':
-            return ["None", "Corner", "Overlay", "Segment", "All segments", "Recurrence plot"][self.stats_mode]
-        elif name == 'stats_x':
-            return self.analyzer.stat_name(i=self.stats_x)
-        elif name == 'stats_y':
-            return self.analyzer.stat_name(i=self.stats_y)
-
-    # def update_menu(self):
-    # 	for name in self.menu_vars:
-    # 		self.menu_vars[name].set(self.get_nested_attr(name))
-    # 	for (name, info) in self.menu_params.items():
-    # 		value = '['+Board.fracs2st(self.world.params[name])+']' if name=='b' else self.world.params[name]
-    # 		self.menu.children[info[0]].entryconfig(info[1], label='{text} ({param} = {value})'.format(text=info[2], param=name, value=value))
-    # 	for (name, info) in self.menu_values.items():
-    # 		value = self.get_value_text(name)
-    # 		self.menu.children[info[0]].entryconfig(info[1], label='{text} [{value}]'.format(text=info[2], value=value))
-
     PARAM_TEXT = {'m': 'Field center', 's': 'Field width', 'R': 'Space units', 'T': 'Time units', 'dr': 'Space step', 'dt': 'Time step', 'b': 'Kernel peaks'}
     VALUE_TEXT = {'animal': 'Animal', 'kn': 'Kernel core', 'gn': 'Field func', 'show_what': 'Show', 'colormap_id': 'Colors'}
-
-    # def create_menu(self):
-    # 	self.menu_vars = {}
-    # 	self.menu_params = {}
-    # 	self.menu_values = {}
-    # 	self.menu = tk.Menu(self.win, tearoff=True)
-    # 	self.win.config(menu=self.menu)
-    #
-    # 	items2 = ['^automaton.is_gpu|Use GPU|c+G' if self.automaton.has_gpu else '|No GPU available|']
-    # 	self.menu.add_cascade(label='Main', menu=self.create_submenu(self.menu, [
-    # 		'^is_run|Start|Return', '|Once|Space'] + items2 + [None,
-    # 		'@show_what|Display|Tab', '@colormap_id|Colors|QuoteLeft|`', None,
-    # 		'|Show animal name|Comma|,', '|Show params|Period|.', '|Show info|Slash|/', '|Show auto-rotate info|s+Slash|s+/', None,
-    # 		'|Save data & image|c+N', '|Save with expanded format|s+c+N',  '|Save next in sequence|c+B',
-    # 		'^recorder.is_recording|Record video & gif|c+M', '|Record with frames saved|s+c+M', None,
-    # 		'|Quit|Escape']))
-    #
-    # 	self.menu.add_cascade(label='Move', menu=self.create_submenu(self.menu, [
-    # 		'^is_auto_center|Auto-center mode|M', None,
-    # 		'|(Small adjust)||s+Up', '|(Large adjust)||m+Up',
-    # 		'|Move up|Up', '|Move down|Down', '|Move left|Left', '|Move right|Right']))
-    #
-    # 	self.menu.add_cascade(label='Rotate', menu=self.create_submenu(self.menu, [
-    # 		'|Rotate clockwise|PageUp', '|Rotate anti-clockwise|PageDown', None,
-    # 		'|(Small adjust)||s+]', '|Sampling period + 10|BracketRight|]', '|Sampling period - 10|BracketLeft|[', '|Run one sampling period|s+Space', None,
-    # 		'^is_auto_rotate|Auto-rotate mode|BackSlash|\\', '|Symmetry axes + 1|c+BracketRight|c+]', '|Symmetry axes - 1|c+BracketLeft|c+[', '^is_ang_clockwise|Clockwise|c+BackSlash|c+\\']))
-    #
-    # 	items2 = []
-    # 	# for (key, code) in self.ANIMAL_KEY_LIST.items():
-    # 		# id = self.get_animal_id(code)
-    # 		# if id: items2.append('|{name} {cname}|{key}'.format(**self.animal_data[id], key=key))
-    # 	self.menu.add_cascade(label='Animal', menu=self.create_submenu(self.menu, [
-    # 		'|Place at center|Z', '|Place at random|X',
-    # 		'|Previous animal|C', '|Next animal|V', '|Previous 10|s+C', '|Next 10|s+V', None,
-    # 		'|Shortcuts 1-10|1', '|Shortcuts 11-20|s+1', '|Shortcuts 21-30|c+1', None,
-    # 		('Full list', self.get_animal_nested_list())]))
-    #
-    # 	self.menu.add_cascade(label='Cells', menu=self.create_submenu(self.menu, [
-    # 		'|Clear|Backspace', '|Random|B', '|Random (last seed)|N', None,
-    # 		'|Flip vertically|Home', '|Flip horizontally|End',
-    # 		'|Mirror horizontally|Equal|=', '|Mirror flip|s+Equal|+', '|Mirror diagonally|c+Equal|c+=', None,
-    # 		'|Copy|c+C', '|Copy as table|c+X', '|Paste|c+V', None,
-    # 		'^is_auto_load|Auto put (place/paste/random)|c+Z', '^is_layered|Layer mode|s+c+X']))
-    #
-    # 	items2 = ['|More peaks|SemiColon', '|Fewer peaks|s+SemiColon', None]
-    # 	for i in range(5):
-    # 		items2.append('|Higher peak {n}|{key}'.format(n=i+1, key='YUIOP'[i]))
-    # 		items2.append('|Lower peak {n}|{key}'.format(n=i+1, key='s+'+'YUIOP'[i]))
-    # 	items2 += [None, '|Random peaks & field|s+c+E']
-    #
-    # 	# '@animal||', '#m|Field center', '#s|Field width', '#R|Space units', '#T|Time units', '#b|Kernel peaks',
-    # 	self.menu.add_cascade(label='Params', menu=self.create_submenu(self.menu, [
-    # 		'|(Small adjust)||s+Q', '|Higher field (m + 0.01)|Q', '|Lower field (m - 0.01)|A',
-    # 		'|Wider field (s + 0.001)|W', '|Narrower field (s - 0.001)|S', None,
-    # 		'|More states (P + 10)|E', '|Fewer states (P - 10)|D',
-    # 		'|Bigger size (R + 10)|R', '|Smaller size (R - 10)|F',
-    # 		'|Slower speed (T * 2)|T', '|Faster speed (T / 2)|G', None,
-    # 		('Peaks', items2), None,
-    # 		'|Reset states|c+D', '|Reset size|c+R', '|Animal\'s original size|c+F']))
-    #
-    # 	self.menu.add_cascade(label='Options', menu=self.create_submenu(self.menu, [
-    # 		'|Search field higher|c+Q', '|Search field lower|c+A', '|Random field|c+E', None,
-    # 		'@kn|Kernel core|c+Y', '@gn|Field func|c+U',
-    # 		'^automaton.is_soft_clip|Use soft clip|c+I', '^automaton.is_multi_step|Use multi-step|c+O',
-    # 		'^automaton.is_inverted|Invert|c+P']))
-    #
-    # 	self.menu.add_cascade(label='Stats', menu=self.create_submenu(self.menu, [
-    # 		'@markers_mode|Show marks|H', '^is_show_fps|Show FPS|c+H', None,
-    # 		'@stats_mode|Show stats|J', '@stats_x|Stats X axis|K', '@stats_y|Stats Y axis|L', None,
-    # 		'|Clear segment|c+J', '|Clear all segments|s+c+J', '^analyzer.is_trim_segment|Trim segments|c+K', '^is_group_params|Group by params|c+L']))
 
     def get_info_st(self):
         return 'gen={}, t={}s, dt={}s, world={}x{}, pixel={}, P={}, sampl={}'.format(self.automaton.gen, self.automaton.time, 1 / self.world.params['T'], SIZEX, SIZEY, PIXEL,
@@ -1145,35 +1076,6 @@ class Lenia:
         else:
             return 'not in auto-rotate mode'
 
-    def update_info_bar(self):
-        global STATUS
-        if self.excess_key:
-            # print(self.excess_key)
-            self.excess_key = None
-        if self.info_type or STATUS or self.is_show_fps:
-            info_st = ""
-            if STATUS:
-                info_st = "\n".join(STATUS)
-            elif self.is_show_fps and self.fps:
-                info_st = 'FPS: {0:.1f}'.format(self.fps)
-            elif self.info_type == 'params':
-                info_st = self.world.params2st()
-            elif self.info_type == 'animal':
-                info_st = self.world.long_name()
-            elif self.info_type == 'info':
-                info_st = self.get_info_st()
-            elif self.info_type == 'angular':
-                info_st = self.get_angular_st()
-            elif self.info_type == 'stats':
-                info_st = 'X axis: {0}, Y axis: {1}'.format(self.analyzer.stat_name(i=self.stats_x), self.analyzer.stat_name(i=self.stats_y))
-            elif self.info_type in self.menu_values:
-                info_st = "{text} [{value}]".format(text=self.VALUE_TEXT[self.info_type], value=self.get_value_text(self.info_type))
-            self.info_bar.config(text=info_st)
-            STATUS = []
-            self.info_type = None
-            if self.clear_job is not None:
-                self.win.after_cancel(self.clear_job)
-            self.clear_job = self.win.after(5000, self.clear_info)
 
     def clear_info(self):
         self.info_bar.config(text="")
@@ -1191,56 +1093,159 @@ class Lenia:
             self.recorder.finish_record()
         self.win.destroy()
 
+    def normalize_control(self, val, start_min, start_max, end_min, end_max):
+        return (val - start_min) / (start_max - start_min) * (end_max - end_min) + end_min
 
     def run(self):
+        # t_signal = - self.signals[0]
+        # sig_t_min, sig_t_max = t_signal.mean() - 2 * t_signal.std(), t_signal.mean() + t_signal.std()
+        t_min, t_max = 5, 40
+        #
+        # r_signal = self.signals[3]
+        # sig_r_min, sig_r_max = r_signal.min(), r_signal.max()
+        # r_min, r_max = self.controls['R'].min(), self.controls['R'].max()
+        #
+        # c_signal = self.signals[1]
+        #
+        # switch_signal = self.signals[4]
 
+        # self.last_real_time = 0
         counter = 0
+        # centers = np.arange(0, t_signal.size * WIN_LEN * OVERLAP, OVERLAP * WIN_LEN) * 1000
+        # mt_centers = np.arange(0, r_signal.size * MID_WIN_LEN * MID_OVERLAP, MID_WIN_LEN * MID_OVERLAP) * 1000
+        # last_switch = self.real_time
+        # last_switch_cmap = self.real_time
+        times = []
+
+        if AUDIO_CONTROL:
+            stream_data = self.mic_stream.get(get_peak_fft=True, get_power=True)
+            memory = dict(zip(stream_data.keys(), [[] for _ in range(len(stream_data.keys()))]))
+            memory['t'] = []
+            keys = sorted(list(memory.keys()))
+            back_memory = 5
+        t_init_0 = time.time()
+        abs_min = np.inf
+        abs_max = 0
+        counter_since_last_switch = 0
         while self.is_loop:
-            counter += 1
+            t_init = time.time()
+            # index_short = np.argmin(np.abs(self.real_time - centers))
+            # index_mid = np.argmin(np.abs(self.real_time - mt_centers))
 
-            controls = dict()
-            notes = []
-            for msg in MIDI_PORT.iter_pending():
-                print(msg)
-                try:
-                    controls[msg.control] = msg.value
-                except:
-                    notes.append(msg.note)
+            # if index_mid < (r_signal.size - 1):
+            #     # SET R
+            #     value = r_signal[index_mid]
+            #     R = self.normalize_control(value, sig_r_min, sig_r_max, r_min, r_max)
+            #     # print('R: ', R)
+            #     self.world.params['R'][0] = int(R)
+            #     print(int(R))
+            #     self.tx['R'][0] = int(R)  # int(max(self.initial_world_params['R'][self.kernel_id] + self.controls[key][value], 5))
+            #     # self.tx['R'][0] /= 2
+            #     self.transform_world()
+            #     self.automaton.calc_once(is_update=False)
+            #     self.automaton.calc_kernel()
 
-            if len(controls.keys()) > 0:
-                self.update_midi_controls(controls)
+            if AUDIO_CONTROL:
+                stream_data = self.mic_stream.get(get_peak_fft=True, get_power=True)
+                for k in stream_data.keys():
+                    memory[k].append(stream_data[k])
+                memory['t'].append(t_init - t_init_0)
+                inds = np.argwhere( np.array(memory['t']) < ((t_init - t_init_0) - back_memory)).flatten()
+                if inds.size > 0:
+                    for k in keys:
+                        memory[k] = memory[k][inds[-1] + 1:]
 
-                if list(controls.keys())[0] in NOTES:
-                    self.update_midi_notes(list(controls.keys())[0])
+                if 'power' in keys:
+                    if len(memory['power']) > 2:
 
-            if self.is_empty:
-                self.load_animal_id(np.random.randint(len(self.animal_data)))
-                self.is_empty = False
-            if self.last_key:
-                self.process_key(self.last_key)
-                self.last_key = None
-            if self.is_closing:
-                break
-            if self.is_run:
-                self.calc_fps()
-                self.automaton.calc_once()
-                self.analyzer.center_world()
-                # self.analyzer.calc_stats()
-                # self.analyzer.add_stats()
-                if not self.is_layered:
-                    self.back = None
-                    self.clear_transform()
-                if self.search_dir != None:
-                    self.search_params()
-                elif self.trace_m != None:
-                    self.trace_params()
-                if self.run_counter != -1:
-                    self.run_counter -= 1
-                    if self.run_counter == 0:
-                        self.is_run = False
-            if counter % self.show_freq == 0:
-                #self.update_info_bar()
-                self.update_win()
+                        av_power = np.mean(memory['power'])
+                        max_power = np.max(memory['power'])
+                        min_power = np.min(memory['power'])
+                    else:
+                        min_power = 200
+                        max_power = 1000
+                    if min_power < abs_min:
+                        abs_min = min_power
+                    if max_power > abs_max:
+                        abs_max = max_power
+                    # print(abs_min, abs_max)
+                    def normalize_power(power, t_min, t_max):
+                        return - ((power - min_power) / (max_power - min_power) * (t_max - t_min) - t_max)
+
+            if True: # index_short < (t_signal.size - 1):
+                # SET T
+                if AUDIO_CONTROL:
+                    if 'power' in keys:
+                        print(stream_data['power'])
+                        if stream_data['power'] > 2500 and counter_since_last_switch > 3:
+                            self.colormap_id = (self.colormap_id + 1) % len(self.colormaps)
+                            counter_since_last_switch = 0
+                            # T = normalize_power(stream_data['power'], t_min=t_min, t_max=10)
+                            # print('DETECTED')
+
+                        counter_since_last_switch += 1
+                            # T = normalize_power(stream_data['power'], t_min=10, t_max=t_max)
+                        # print('T: ', T)
+                        # self.world.params['T'] = int(T)
+
+                # countrer += 1
+                controls = dict()
+                notes = []
+                for msg in MIDI_PORT.iter_pending():
+                    # print(msg)
+                    try:
+                        controls[msg.control] = msg.value
+                    except:
+                        notes.append(msg.note)
+
+                if len(controls.keys()) > 0:
+                    self.update_midi_controls(controls)
+
+                    # if list(controls.keys())[0] in NOTES:
+                    #     self.update_midi_notes(list(controls.keys())[0])
+
+                if self.is_empty:
+                    self.load_animal_id(np.random.randint(len(self.animal_data)))
+                    self.is_empty = False
+                if self.last_key:
+                    self.process_key(self.last_key)
+                    self.last_key = None
+                if self.is_closing:
+                    break
+                if self.is_run:
+                    self.calc_fps()
+                    self.automaton.calc_once()
+                    self.analyzer.center_world()
+                    # self.analyzer.calc_stats()
+                    # self.analyzer.add_stats()
+                    if not self.is_layered:
+                        self.back = None
+                        self.clear_transform()
+                    if self.search_dir != None:
+                        self.search_params()
+                    elif self.trace_m != None:
+                        self.trace_params()
+                    if self.run_counter != -1:
+                        self.run_counter -= 1
+                        if self.run_counter == 0:
+                            self.is_run = False
+                if counter % self.show_freq == 0:
+                    #self.update_info_bar()
+                    self.update_win()
+
+                # SAVE IMG
+                # self.img.save("/home/flowers/Desktop/Perso/Scratch/funky_lenia/data/save/test7/{}.png".format(self.real_time))
+                self.img_count += 1
+                # print('Im #{}'.format(self.img_count))
+
+            else:
+                self.is_loop = False
+                print('THE END')
+                os.system("ffmpeg -r 20 -i im_%d.png -vcodec mpeg4 -y movie.mp4")
+            times.append(time.time() - t_init)
+
+            stop = 1
+            # print(times[-1])
 
 
 if __name__ == '__main__':
